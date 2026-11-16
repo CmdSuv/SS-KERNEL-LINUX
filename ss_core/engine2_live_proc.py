@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .models import Confidence, Finding, ScanContext, Severity
+from .models import Confidence, Finding, ScanContext, ScanStatus, Severity
 from .signatures import (
     CONTEXTUAL_CHEAT_MODULES,
     HIGH_SIGNAL_MODULE_NAMES,
@@ -102,6 +102,18 @@ BENIGN_PRELOAD_HINTS: tuple[str, ...] = (
     "gameoverlayrenderer.so",
     "libgtk3-nocsd.so",
 )
+
+REMAPPER_DAEMON_NAMES: frozenset[str] = frozenset(
+    {
+        "input-remapper-service",
+        "input-remapper-gtk",
+        "input-remapper-control",
+        "input-remapper-reader-service",
+        "evtest",
+    }
+)
+_PURE_MACRO_PROCESS_NAMES: frozenset[str] = MACRO_PROCESS_NAMES - REMAPPER_DAEMON_NAMES
+_TMP_MAPPED_EXT_RE = re.compile(r"(?:\.so(?:\.\d+)*|\.jar|\.dll|\.exe)$", re.IGNORECASE)
 
 # Legitimate native GUI/Browser/IDE JIT runtimes that legitimately allocate rwxp pages
 LEGIT_JIT_COMMS: frozenset[str] = frozenset(
@@ -766,6 +778,22 @@ def _inspect_process_metadata(
 
     # 6. Process name / cmdline cheat & macro signature check
     strict, high_ctx, _ = match_cheat_signatures(f"{proc.comm} {proc.cmdline_str}")
+    exe_base = os.path.basename(proc.exe.split(" (deleted)")[0]).lower() if proc.exe else ""
+    cmd_bases = [os.path.basename(tok).lower() for tok in proc.cmdline[:4] if tok and not tok.startswith("-")]
+    is_pure_macro = (
+        comm_low in _PURE_MACRO_PROCESS_NAMES
+        or exe_base in _PURE_MACRO_PROCESS_NAMES
+        or any(
+            b in _PURE_MACRO_PROCESS_NAMES or any(b.startswith(f"{m}.") for m in _PURE_MACRO_PROCESS_NAMES)
+            for b in cmd_bases
+        )
+    )
+    is_remapper_daemon = not is_pure_macro and (
+        comm_low in REMAPPER_DAEMON_NAMES
+        or comm_low.startswith("input-remapper")
+        or exe_base in REMAPPER_DAEMON_NAMES
+        or any(b in REMAPPER_DAEMON_NAMES for b in cmd_bases)
+    )
     if strict or high_ctx:
         ctx.add_finding(
             Finding(
@@ -784,9 +812,7 @@ def _inspect_process_metadata(
             )
         )
         proc.is_suspicious = True
-    elif comm_low in MACRO_PROCESS_NAMES or any(
-        f"/{m}" in cmd_low or cmd_low.startswith(m) for m in MACRO_PROCESS_NAMES
-    ):
+    elif is_pure_macro:
         ctx.add_finding(
             Finding(
                 rule_id="E2-PROC-MACRO-BIN",
@@ -801,6 +827,24 @@ def _inspect_process_metadata(
             )
         )
         proc.is_suspicious = True
+    elif is_remapper_daemon:
+        ctx.add_finding(
+            Finding(
+                rule_id="E2-PROC-MACRO-BIN",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.MEDIUM,
+                category="Input Remapper Daemon",
+                title=f"Girdi esleme / remapper sureci aktif: {proc.comm} (PID {proc.pid})",
+                description=(
+                    "Sistemde genel amacli tus/fare esleme servisi (input-remapper/evtest) calisiyor. "
+                    "Tek basina hile kaniti degildir; Engine 3 makro profilleriyle birlikte degerlendirilir."
+                ),
+                evidence=[f"comm={proc.comm}", f"exe={proc.exe}", f"cmdline={proc.cmdline_str[:220]}"],
+                pid=proc.pid,
+                metadata={"remapper_daemon": True},
+            )
+        )
 
     # 7. Namespace / container isolation detection for Java/Minecraft/Wine
     if init_ns and (proc.is_minecraft or proc.is_java or proc.is_wine or proc.is_suspicious):
@@ -877,12 +921,14 @@ def _inspect_maps_and_fds(ctx: ScanContext, proc: ProcInfo) -> list[tuple[int, i
                 if not _is_benign_deleted_map(pathname, perms):
                     deleted_mapped.append(pathname)
 
+            clean_low_p = re.sub(r"\s*\(deleted\)$", "", low_p).strip()
             if (
-                any(low_p.startswith(t) for t in ("/tmp/", "/dev/shm/", "/var/tmp/"))
-                and not low_p.startswith("/tmp/.mount_")
-                and (".so" in low_p or ".jar" in low_p or ".dll" in low_p or ".exe" in low_p)
+                any(clean_low_p.startswith(t) for t in ("/tmp/", "/dev/shm/", "/var/tmp/"))
+                and not clean_low_p.startswith("/tmp/.mount_")
+                and _TMP_MAPPED_EXT_RE.search(clean_low_p)
+                and not ("x" not in perms and any(clean_low_p.startswith(b) for b in BENIGN_DELETED_MAP_HINTS))
             ):
-                bname = os.path.basename(pathname.split(" (deleted)")[0])
+                bname = os.path.basename(re.sub(r"\s*\(deleted\)$", "", pathname).strip())
                 if not _is_legit_tmp_so(bname):
                     if pathname not in tmp_mapped:
                         tmp_mapped.append(pathname)
@@ -1230,7 +1276,10 @@ def _scan_region_bytes(
                 and data[idx + 5] in (1, 2)
                 and data[idx + 6] == 1
                 and data[idx + 9 : idx + 16] == b"\x00" * 7
-                and data[idx + 16] in (1, 2, 3)
+                and (
+                    (data[idx + 5] == 1 and data[idx + 16] in (1, 2, 3) and data[idx + 17] == 0)
+                    or (data[idx + 5] == 2 and data[idx + 16] == 0 and data[idx + 17] in (1, 2, 3))
+                )
             ):
                 hit = f"0x{base_addr + idx:x} [anon mem ELF header]"
                 if hit not in reflective_elf_hits:
@@ -1302,6 +1351,10 @@ def _scan_process_memory(
 
     try:
         for start, end, perms, pathname in ordered:
+            if ctx.is_cancelled():
+                from .orchestrator import ScanCancelledError
+
+                raise ScanCancelledError("Tarama kullanici tarafindan iptal edildi.")
             if total_scanned >= budget:
                 break
             size = end - start
@@ -1312,6 +1365,10 @@ def _scan_process_memory(
             prev_tail = b""
             consecutive_err = 0
             while offset < end and total_scanned < budget:
+                if ctx.is_cancelled():
+                    from .orchestrator import ScanCancelledError
+
+                    raise ScanCancelledError("Tarama kullanici tarafindan iptal edildi.")
                 to_read = min(chunk_size, end - offset, budget - total_scanned)
                 try:
                     buf = os.pread(fd, to_read, offset)
@@ -1415,20 +1472,35 @@ def _inspect_hsperfdata_and_jcmd(ctx: ScanContext, java_procs: list[ProcInfo]) -
                     strings_found = re.findall(rb"[\x20-\x7e]{6,}", raw)
                     joined = "\n".join(s.decode("ascii", errors="replace") for s in strings_found)
                     strict, high_ctx, _ = match_cheat_signatures(joined)
-                    if strict or high_ctx or "-javaagent" in joined.lower() or "-agentpath" in joined.lower():
+                    jlow = joined.lower()
+                    if strict or high_ctx or "-javaagent" in jlow or "-agentpath" in jlow:
                         ev = [
                             ln[:200]
                             for ln in joined.splitlines()
                             if any(k in ln.lower() for k in ("-javaagent", "-agentpath", *strict, *high_ctx))
                         ]
+                        is_lunar_only = (
+                            bool(ev)
+                            and not strict
+                            and not high_ctx
+                            and "-agentpath" not in jlow
+                            and "disableattachmechanism" not in jlow
+                            and "perfdisablesharedmem" not in jlow
+                            and "-xbootclasspath" not in jlow
+                            and all(".lunarclient" in ln.lower() and "ichor" in ln.lower() for ln in ev)
+                        )
                         ctx.add_finding(
                             Finding(
                                 rule_id="E2-HSPERF-SUSPICIOUS",
                                 engine=ENGINE_NAME,
-                                severity=Severity.CRITICAL if strict else Severity.HIGH,
+                                severity=Severity.INFO if is_lunar_only else (Severity.CRITICAL if strict else Severity.HIGH),
                                 confidence=Confidence.HIGH,
                                 category="JVM PerfData Trace",
-                                title=f"hsperfdata JVM belleginde supheli arguman/iz: {perf_file.name}",
+                                title=(
+                                    f"hsperfdata Lunar Ichor agent izi: {perf_file.name}"
+                                    if is_lunar_only
+                                    else f"hsperfdata JVM belleginde supheli arguman/iz: {perf_file.name}"
+                                ),
                                 description="Java HotSpot performans verisi icinde agent veya hile parametresi bulundu.",
                                 evidence=ev[:10],
                                 path=str(perf_file),
@@ -1480,14 +1552,33 @@ def _inspect_hsperfdata_and_jcmd(ctx: ScanContext, java_procs: list[ProcInfo]) -
                             )
                         ]
                         if lines:
+                            strict2, high2, _ = match_cheat_signatures(out2)
+                            is_lunar_only = (
+                                not strict2
+                                and not high2
+                                and not any(
+                                    bad in low2
+                                    for bad in (
+                                        "-agentpath:",
+                                        "disableattachmechanism",
+                                        "perfdisablesharedmem",
+                                        "-xbootclasspath",
+                                    )
+                                )
+                                and all(".lunarclient" in ln.lower() and "ichor" in ln.lower() for ln in lines)
+                            )
                             ctx.add_finding(
                                 Finding(
                                     rule_id="E2-JCMD-FLAGS",
                                     engine=ENGINE_NAME,
-                                    severity=Severity.HIGH,
+                                    severity=Severity.INFO if is_lunar_only else Severity.HIGH,
                                     confidence=Confidence.CONFIRMED,
                                     category="JVM Live Flags",
-                                    title=f"jcmd {cmd_name} icinde agent/ozel JVM bayragi (PID {proc.pid})",
+                                    title=(
+                                        f"jcmd {cmd_name} icinde Lunar Ichor agent izi (PID {proc.pid})"
+                                        if is_lunar_only
+                                        else f"jcmd {cmd_name} icinde agent/ozel JVM bayragi (PID {proc.pid})"
+                                    ),
                                     description="Canli JVM bayraklari/sistem ozelliklerinde enjeksiyon izi tespit edildi.",
                                     evidence=lines[:10],
                                     pid=proc.pid,
@@ -1596,6 +1687,11 @@ _CORE_TEXT_COW_LIBS = (
 )
 
 
+_SMAPS_HDR_RE = re.compile(
+    r"^[0-9a-fA-F]+-[0-9a-fA-F]+\s+[rwxps-]{4}\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+:[0-9a-fA-F]+\s+\d+(?:\s+.*)?$"
+)
+
+
 def _inspect_smaps_text_cow(ctx: ScanContext, proc: ProcInfo) -> None:
     """Detect Copy-on-Write dirty anonymous pages inside read-only file-backed .text VMAs."""
     smaps_text = safe_read_text(ctx.proc_root / str(proc.pid) / "smaps", max_bytes=12 * 1024 * 1024)
@@ -1625,7 +1721,7 @@ def _inspect_smaps_text_cow(ctx: ScanContext, proc: ProcInfo) -> None:
                 crit_hit = True
 
     for ln in smaps_text.splitlines():
-        if "-" in ln and len(ln) > 20 and " " in ln and not ln[0].isupper():
+        if _SMAPS_HDR_RE.match(ln):
             _flush()
             parts = ln.split(None, 5)
             cur_hdr = ln if len(parts) >= 5 else ""
@@ -1726,10 +1822,22 @@ def run(ctx: ScanContext) -> None:
             f"Canli RAM Bellek Taramasi ({len(mem_targets)} hedef surec, enabled={ctx.enable_memory_scan})",
         )
 
+        if not ctx.enable_memory_scan:
+            ctx.set_coverage("E2.proc_mem", ScanStatus.SKIPPED, "Live /proc/<pid>/mem scan disabled")
+        elif ctx.telemetry.get("ram_scan_denied_pids"):
+            denied_n = len(ctx.telemetry.get("ram_scan_denied_pids") or [])
+            ctx.set_coverage("E2.proc_mem", ScanStatus.PERMISSION_DENIED, f"{denied_n} target PID(s) denied /proc/<pid>/mem access")
+        else:
+            ctx.set_coverage("E2.proc_mem", ScanStatus.COMPLETED, f"{len(mem_targets)} target process(es) inspected")
+
         emit_scan_progress(ctx, 0.94, "JVM hsperfdata, jcmd ve container ortamlari kontrol ediliyor...")
         _inspect_hsperfdata_and_jcmd(ctx, [p for p in procs if p.is_java or p.is_minecraft])
         _check_live_containers(ctx)
         record_scan_region(ctx, "E2", f"{ctx.sys_path('/tmp')}/hsperfdata_* ve container runtime ortamlari")
+        ctx.set_coverage("E2.processes", ScanStatus.COMPLETED, f"{len(procs)} processes enumerated")
         emit_scan_progress(ctx, 1.0, "Canli surec ve RAM analizi tamamlandi.")
     except Exception as exc:
+        if exc.__class__.__name__ == "ScanCancelledError":
+            raise
+        ctx.set_coverage("E2.processes", ScanStatus.ERROR, str(exc))
         ctx.add_error(ENGINE_NAME, f"Beklenmeyen hata: {exc}")

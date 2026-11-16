@@ -96,8 +96,11 @@ def build_target(
     if cp_run.returncode != 0:
         return cp_run.returncode
     if cleanup_image:
-        print(f"    CLEAN: removing builder image {image_tag} & pruning intermediate layers...")
+        base_img = cfg.get("base_image", "")
+        print(f"    CLEAN: removing builder image {image_tag} + base image {base_img} & pruning layers...")
         subprocess.run([podman_bin, "rmi", "-f", image_tag], check=False)
+        if base_img:
+            subprocess.run([podman_bin, "rmi", "-f", base_img], check=False)
         subprocess.run([podman_bin, "image", "prune", "-f"], check=False)
     return 0
 

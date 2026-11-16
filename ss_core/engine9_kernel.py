@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import priv_helper
-from .models import Confidence, Finding, ScanContext, Severity
+from .models import Confidence, Finding, ScanContext, ScanStatus, Severity
 from .utils import emit_scan_progress, record_scan_region
 
 ENGINE_NAME = "Engine 9: Ring-0 Kernel, DMA/IOMMU & Donanim Forensigi"
@@ -55,6 +55,8 @@ _KNOWN_SAFE_OOT_MOD_PREFIXES = (
     "hid_fanatec",
     "hid_logitech_new",
     "hid_tmff_new",
+    "hid_asus",
+    "hid_lenovo",
     "gcadapter_oc",
     "system76",
     "kvmfr",
@@ -62,6 +64,9 @@ _KNOWN_SAFE_OOT_MOD_PREFIXES = (
     "msi_",
     "tuxedo_",
     "clevo_",
+    "lg_laptop",
+    "hhd",
+    "steam_",
     "binder_linux",
     "ashmem_linux",
     "r8168",
@@ -71,6 +76,10 @@ _KNOWN_SAFE_OOT_MOD_PREFIXES = (
     "apple_bce",
     "framework_laptop",
     "virtualbox",
+    "zfs",
+    "spl",
+    "icp",
+    "drivetemp",
     "mc_ss_kmod",
 )
 
@@ -95,6 +104,13 @@ _KNOWN_SAFE_EBPF_NAMES = (
     "firewalld",
     "nftables",
     "libbpf_",
+    "scx_",
+    "bpfman",
+    "docker",
+    "containerd",
+    "netdata",
+    "tailscale",
+    "pipewire",
 )
 
 _SUSPICIOUS_HOOK_CLASSES = {
@@ -293,6 +309,21 @@ def _analyze_ring0_integrity(ctx: ScanContext, integ_txt: str) -> list[dict[str,
     ctx.telemetry["kernel_khook_checked"] = len(khooks)
     ctx.telemetry["kernel_modinfo_count"] = len(modinfos)
     ctx.telemetry["kernel_modxscan_count"] = len(modxscans)
+    integ_trunc = parse_pipe_kv_lines(integ_txt, "TRUNCATED")
+    if integ_trunc:
+        ctx.set_coverage("E9.lkm.integrity", ScanStatus.PARTIAL, "integrity snapshot truncated at kernel buffer limit")
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-LKM-SNAPSHOT-INCOMPLETE",
+                engine=ENGINE_NAME,
+                severity=Severity.MEDIUM,
+                confidence=Confidence.CONFIRMED,
+                category="Kernel Scan Coverage",
+                title="Ring-0 LKM bütünlük modül listesi kapasite sınırında kırpıldı",
+                description="Çekirdekteki modül sayısı snapshot üst sınırını aştığı için bazı modüller incelenememiş olabilir.",
+                evidence=[f"TRUNCATED: {rec}" for rec in integ_trunc[:5]],
+            )
+        )
 
     # 0. MSR_LSTAR syscall entry integrity
     for se in syscall_entries:
@@ -342,7 +373,21 @@ def _analyze_ring0_integrity(ctx: ScanContext, integ_txt: str) -> list[dict[str,
                     ],
                 )
             )
-        if hcls in _SUSPICIOUS_HOOK_CLASSES:
+        is_suspicious_call = (
+            hcls == "CALL_REL32"
+            and (
+                bool(_extract_mod_from_sym(jmp_sym))
+                or jmp_sym.startswith("0x")
+            )
+        )
+        if hcls in _SUSPICIOUS_HOOK_CLASSES or is_suspicious_call:
+            is_core_ftrace_thunk = (
+                pte_rw == "0"
+                and not _extract_mod_from_sym(jmp_sym)
+                and jmp_sym.startswith(("__fentry__", "ftrace_caller", "ftrace_regs_caller", "__x86_return_thunk", "srso_", "__SCK__"))
+            )
+            if is_core_ftrace_thunk:
+                continue
             ctx.add_finding(
                 Finding(
                     rule_id="E9-KERNEL-INLINE-HOOK",
@@ -351,7 +396,7 @@ def _analyze_ring0_integrity(ctx: ScanContext, integ_txt: str) -> list[dict[str,
                     confidence=Confidence.CONFIRMED,
                     category="Ring-0 Rootkit Detection",
                     title=f"Kritik çekirdek fonksiyonunda inline hook/trambolin tespit edildi: {sym}",
-                    description="Çekirdek fonksiyon girişinde olağan dışı JMP / int3 kancası bulundu.",
+                    description="Çekirdek fonksiyon girişinde olağan dışı JMP / call / int3 kancası bulundu.",
                     evidence=[
                         f"Fonksiyon: {sym} ({kh.get('addr')})",
                         f"Hook Türü: {hcls} -> Hedef: {kh.get('jmp_target')} ({jmp_sym})",
@@ -537,8 +582,18 @@ def _analyze_ring0_integrity(ctx: ScanContext, integ_txt: str) -> list[dict[str,
 def _analyze_ring0_tasks_and_vmas(ctx: ScanContext, tasks_txt: str) -> None:
     tasks = parse_pipe_kv_lines(tasks_txt, "TASK")
     vma_anoms = parse_pipe_kv_lines(tasks_txt, "VMA_ANOM")
+    trunc_recs = parse_pipe_kv_lines(tasks_txt, "TRUNCATED")
+    vma_sums = parse_pipe_kv_lines(tasks_txt, "TASK_VMA_SUM")
+    vma_sum_trunc = [s for s in vma_sums if s.get("truncated") == "1"]
     ctx.telemetry["ring0_task_count"] = len(tasks)
     ctx.telemetry["ring0_vma_anomalies"] = len(vma_anoms)
+    ctx.telemetry["ring0_tasks_truncated"] = bool(trunc_recs or vma_sum_trunc)
+    if trunc_recs or vma_sum_trunc:
+        ctx.set_coverage(
+            "E9.ring0_tasks",
+            ScanStatus.PARTIAL,
+            f"Kernel task/VMA snapshot truncated (task_trunc={len(trunc_recs)}, vma_trunc={len(vma_sum_trunc)})",
+        )
 
     if tasks:
         # Cross-check Ring-0 init_task TGIDs vs userspace /proc enumeration
@@ -828,6 +883,15 @@ def _analyze_dma_pci_iommu(
                         pass
                 grp_link = dev_dir / "iommu_group"
                 iommu_grp = grp_link.resolve().name if grp_link.exists() else "-1"
+                sysfs_dom = "UNKNOWN_NO_LKM"
+                if iommu_grp not in ("-1", ""):
+                    gtype = _read_text(ctx.sys_path(f"/sys/kernel/iommu_groups/{iommu_grp}/type")).lower()
+                    if gtype == "dma":
+                        sysfs_dom = "DMA_STRICT_OR_TRANSLATED"
+                    elif gtype == "dma-fq":
+                        sysfs_dom = "DMA_FQ_TRANSLATED"
+                    elif gtype == "identity":
+                        sysfs_dom = "IDENTITY_PASSTHROUGH"
                 pci_records.append(
                     {
                         "bdf": dev_dir.name,
@@ -839,7 +903,7 @@ def _analyze_dma_pci_iommu(
                         "hdr": hdr_hex,
                         "driver": drv,
                         "iommu_grp": iommu_grp,
-                        "iommu_dom": "UNKNOWN_NO_LKM",
+                        "iommu_dom": sysfs_dom,
                         "bme_hw": bme_hw,
                         "bme_sw": bme_hw,
                         "untrusted": "0",
@@ -869,17 +933,41 @@ def _analyze_dma_pci_iommu(
         bme = False if d3cold else (rec.get("bme_hw") == "1")
         ext_info = ext_by_bdf.get(bdf, {})
 
-        # FPGA / PCILeech hardware check
-        if vid in _FPGA_VENDOR_IDS or (vid, did) in _KNOWN_PCILEECH_VID_DIDS:
+        # FPGA / PCILeech hardware check (exempt standard motherboard PLX PCIe bridges bound to pcieport)
+        is_plx_pcie_bridge = (
+            vid == "0x10b5"
+            and cls_raw.startswith("0x0604")
+            and drv == "pcieport"
+            and (vid, did) not in _KNOWN_PCILEECH_VID_DIDS
+        )
+        sysfs_iommu_translated = (
+            iommu["iommu_active"]
+            and not iommu["passthrough_enabled"]
+            and not iommu["forced_off"]
+            and rec.get("iommu_grp", "-1") not in ("-1", "")
+        )
+        if (vid in _FPGA_VENDOR_IDS or (vid, did) in _KNOWN_PCILEECH_VID_DIDS) and not is_plx_pcie_bridge:
+            iommu_protected_drv = (
+                drv not in ("unbound", "vfio-pci", "uio_pci_generic", "uio", "probing")
+                and (
+                    dom in ("DMA_STRICT_OR_TRANSLATED", "DMA_FQ_TRANSLATED")
+                    or (dom == "UNKNOWN_NO_LKM" and sysfs_iommu_translated)
+                )
+                and (vid, did) not in _KNOWN_PCILEECH_VID_DIDS
+            )
             ctx.add_finding(
                 Finding(
                     rule_id="E9-DMA-FPGA-HARDWARE",
                     engine=ENGINE_NAME,
-                    severity=Severity.CRITICAL,
-                    confidence=Confidence.CONFIRMED,
+                    severity=Severity.HIGH if iommu_protected_drv else Severity.CRITICAL,
+                    confidence=Confidence.MEDIUM if iommu_protected_drv else Confidence.CONFIRMED,
                     category="DMA & IOMMU Hardware Protection",
                     title=f"PCIe FPGA / DMA Screamer donanım kimliği tespit edildi ({bdf})",
-                    description=f"{_FPGA_VENDOR_IDS.get(vid, 'FPGA')} — donanım DMA kartı izi!",
+                    description=(
+                        f"{_FPGA_VENDOR_IDS.get(vid, 'FPGA')} — sürücüye bağlı ve IOMMU çevirisi altında devredilen FPGA aygıtı."
+                        if iommu_protected_drv
+                        else f"{_FPGA_VENDOR_IDS.get(vid, 'FPGA')} — donanım DMA kartı izi!"
+                    ),
                     evidence=[
                         f"BDF={bdf} VID:DID={vid}:{did} SVID:SDID={svid}:{sdid}",
                         f"driver={drv} iommu_dom={dom} bme={bme} cfg_sz={rec.get('cfg_sz')}",
@@ -889,17 +977,26 @@ def _analyze_dma_pci_iommu(
 
         # VFIO / UIO raw DMA driver attached with Bus Master or unmanaged IOMMU
         if drv in ("vfio-pci", "uio_pci_generic", "uio") or dom == "UNMANAGED_VFIO":
+            vfio_unprotected = (
+                dom in ("NONE", "IDENTITY_PASSTHROUGH")
+                or (dom == "UNKNOWN_NO_LKM" and not sysfs_iommu_translated)
+                or drv in ("uio_pci_generic", "uio")
+            )
             ctx.add_finding(
                 Finding(
                     rule_id="E9-DMA-VFIO-UIO-DEVICE",
                     engine=ENGINE_NAME,
-                    severity=Severity.CRITICAL,
-                    confidence=Confidence.CONFIRMED,
+                    severity=Severity.CRITICAL if vfio_unprotected else Severity.HIGH,
+                    confidence=Confidence.CONFIRMED if vfio_unprotected else Confidence.HIGH,
                     category="DMA & IOMMU Hardware Protection",
                     title=f"Kullanıcı alanına doğrudan DMA/MMIO açan sürücü bağlı: {drv} ({bdf})",
-                    description="vfio-pci / UIO ile PCIe aygıtı kullanıcı alanı DMA kontrolüne geçirilmiş.",
+                    description=(
+                        "vfio-pci / UIO ile PCIe aygıtı kullanıcı alanı DMA kontrolüne geçirilmiş (IOMMU çevirisi yok veya UIO)."
+                        if vfio_unprotected
+                        else "vfio-pci ile PCIe aygıtı izole IOMMU grubunda kullanıcı alanına devredilmiş (VFIO passthrough)."
+                    ),
                     evidence=[
-                        f"BDF={bdf} VID:DID={vid}:{did} class={cls_raw} driver={drv} iommu_dom={dom} bme={bme}"
+                        f"BDF={bdf} VID:DID={vid}:{did} class={cls_raw} driver={drv} iommu_dom={dom} bme={bme} grp={rec.get('iommu_grp', '-1')}"
                     ],
                 )
             )
@@ -935,6 +1032,9 @@ def _analyze_dma_pci_iommu(
         if not d3cold and (rec.get("cap_loop") == "1" or ext_info.get("cap_loop") == 1):
             is_spoofed = True
             spoof_reasons.append("PCIe capability list döngü/bozulma hatası")
+        if not d3cold and ext_info.get("ext_cap_loop") == 1:
+            is_spoofed = True
+            spoof_reasons.append("PCIe Extended Capability list döngü/bozulma hatası")
         if svid in _FPGA_VENDOR_IDS and vid not in _FPGA_VENDOR_IDS:
             is_spoofed = True
             spoof_reasons.append(f"Ana VID ({vid}) maskelenmiş ancak Subsystem VID FPGA ({svid})!")
@@ -1041,8 +1141,17 @@ def _analyze_ebpf_and_pid_cross(
     pid_cross = native_probe.get("pid_cross", {})
     if isinstance(pid_cross, dict):
         ctx.telemetry["native_pid_cross"] = pid_cross
+        hidepid_on = bool(pid_cross.get("hidepid_detected"))
+        probe_euid = pid_cross.get("euid", 0)
+        if pid_cross.get("error"):
+            ctx.set_coverage("E9.pid_cross", ScanStatus.ERROR, str(pid_cross.get("error")))
+        elif hidepid_on and probe_euid not in (0, None):
+            ctx.set_coverage("E9.pid_cross", ScanStatus.PARTIAL, "Unprivileged /proc hidepid active")
+        else:
+            ctx.set_coverage("E9.pid_cross", ScanStatus.COMPLETED, "PID cross-view sweep complete")
+
         hidden = pid_cross.get("hidden_candidates") or []
-        if hidden:
+        if hidden and not (hidepid_on and probe_euid not in (0, None) and all(h.get("stat_ok") == 0 and not h.get("raw_only") for h in hidden)):
             ctx.add_finding(
                 Finding(
                     rule_id="E9-HIDDEN-PID-READDIR",
@@ -1058,6 +1167,17 @@ def _analyze_ebpf_and_pid_cross(
 
     # 2. Direct sys_bpf() enumeration of active kernel eBPF programs & links
     bpf = native_probe.get("bpf", {})
+    bpf_err = int(bpf.get("errno", 0) or 0) if isinstance(bpf, dict) else 0
+    ctx.telemetry["ebpf_errno"] = bpf_err
+    if bpf_err != 0:
+        ctx.set_coverage(
+            "E9.ebpf",
+            ScanStatus.PERMISSION_DENIED if bpf_err in (1, 13) else ScanStatus.ERROR,
+            f"sys_bpf errno={bpf_err} (yetkisiz veya kisitli)",
+        )
+    elif isinstance(bpf, dict):
+        ctx.set_coverage("E9.ebpf", ScanStatus.COMPLETED, "sys_bpf enumeration complete")
+
     progs = bpf.get("progs") or []
     links = bpf.get("links") or []
     links_by_prog: dict[int, list[dict[str, Any]]] = {}
@@ -1172,6 +1292,27 @@ def _analyze_ebpf_and_pid_cross(
 
 
 def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
+    metas = parse_pipe_kv_lines(events_txt, "EVENT_META")
+    if metas:
+        m0 = metas[0]
+        try:
+            dropped = int(m0.get("dropped", "0") or 0)
+            total_ev = int(m0.get("total", "0") or 0)
+            cap_ev = int(m0.get("cap", "0") or 0)
+        except ValueError:
+            dropped, total_ev, cap_ev = 0, 0, 0
+        ctx.telemetry["ring0_event_cap"] = cap_ev
+        ctx.telemetry["ring0_event_total"] = total_ev
+        ctx.telemetry["ring0_event_dropped"] = dropped
+        if dropped > 0:
+            ctx.set_coverage(
+                "E9.ring0_events",
+                ScanStatus.PARTIAL,
+                f"Ring buffer overflow: {dropped} event dropped out of {total_ev}",
+            )
+        else:
+            ctx.set_coverage("E9.ring0_events", ScanStatus.COMPLETED, f"{total_ev} live events captured")
+
     events = parse_pipe_kv_lines(events_txt, "EVENT")
     ctx.telemetry["ring0_captured_events"] = len(events)
     if not events:
@@ -1179,13 +1320,34 @@ def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
 
     my_pid = os.getpid()
     ptrace_hits: list[str] = []
+    ptrace_unverified: list[str] = []
+    ptrace_failed: list[str] = []
+    ptrace_pids: set[int] = set()
     vmw_hits: list[str] = []
+    vmw_unverified: list[str] = []
+    vmw_failed: list[str] = []
+    vmw_target_pids: set[int] = set()
     memfd_hits: list[str] = []
+    memfd_unverified: list[str] = []
+    memfd_failed: list[str] = []
+    memfd_pids: set[int] = set()
     execveat_hits: list[str] = []
+    execveat_unverified: list[str] = []
+    execveat_failed: list[str] = []
+    execveat_pids: set[int] = set()
     bpf_hits: list[str] = []
+    bpf_unverified: list[str] = []
+    bpf_failed: list[str] = []
+    bpf_pids: set[int] = set()
     iopl_hits: list[str] = []
+    iopl_unverified: list[str] = []
+    iopl_failed: list[str] = []
+    iopl_pids: set[int] = set()
     mod_hits: list[str] = []
     uinput_hits: list[str] = []
+    uinput_unverified: list[str] = []
+    uinput_failed: list[str] = []
+    uinput_pids: set[int] = set()
 
     benign_ptrace_comms = {
         "gdb", "lldb", "strace", "perf", "systemd-coredum", "systemd-coredump",
@@ -1193,44 +1355,100 @@ def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
         "wineserver", "crashpad_handl", "breakpad", "bwrap",
     }
     benign_bpf_comms = {
-        "systemd", "systemd-journal", "bpftune", "firewalld", "podman", "conmon",
-        "ss_kernel_probe", "cilium", "plymouthd",
+        "systemd", "systemd-journal", "systemd-udevd", "systemd-network",
+        "networkmanager", "bpftune", "firewalld", "podman", "conmon",
+        "ss_kernel_probe", "cilium", "plymouthd", "bpftool", "tc", "dockerd",
+        "containerd", "tailscaled", "netdata", "scx_lavd", "scx_rusty", "scx_bpfland",
+        "snapd", "flatpak", "chronyd", "kwin_wayland", "pipewire",
     }
+    benign_execveat_comms = {"bwrap", "runc", "crun", "flatpak-session"}
 
     for ev in events:
         etype = ev.get("type", "")
         pid_str = ev.get("pid", "")
-        if pid_str.isdigit() and int(pid_str) == my_pid:
+        ev_pid = int(pid_str) if pid_str.isdigit() else None
+        if ev_pid == my_pid:
             continue
         comm = ev.get("comm", "")
-        desc = f"comm={comm} pid={pid_str} tgid={ev.get('tgid')} arg0={ev.get('arg0')} arg1={ev.get('arg1')} detail={ev.get('detail')}"
+        detail = ev.get("detail", "")
+        has_ret_present = "has_ret" in ev
+        has_ret = ev.get("has_ret") == "1"
+        explicit_unverified = has_ret_present and not has_ret
+        ret_val: int | None = None
+        if has_ret:
+            try:
+                ret_val = int(ev.get("ret", "0"))
+            except ValueError:
+                ret_val = None
+        failed = (ret_val is not None) and (ret_val < 0)
+        ret_str = f" ret={ret_val}" if has_ret and ret_val is not None else (" has_ret=0" if explicit_unverified else "")
+        desc = f"comm={comm} pid={pid_str} tgid={ev.get('tgid')} arg0={ev.get('arg0')} arg1={ev.get('arg1')}{ret_str} detail={detail}"
+
         if etype == "1":  # SS_EVT_SYSCALL_PTRACE
             if comm in benign_ptrace_comms:
                 continue
             try:
                 req = int(ev.get("arg0", "0"), 16)
+                tpid = int(ev.get("arg1", "0"), 16)
             except ValueError:
-                req = 0
+                req, tpid = 0, 0
             # PTRACE_TRACEME (0) and PTRACE_CONT (7) inside child setup are routine; focus on attach/seize/poke/setregs
             if req in (4, 5, 13, 16, 0x4206) or req not in (0, 7):
-                ptrace_hits.append(desc)
+                if tpid > 0:
+                    ptrace_pids.add(tpid)
+                elif ev_pid:
+                    ptrace_pids.add(ev_pid)
+                if failed:
+                    ptrace_failed.append(desc)
+                elif explicit_unverified:
+                    ptrace_unverified.append(desc)
+                else:
+                    ptrace_hits.append(desc)
         elif etype == "2":  # SS_EVT_SYSCALL_VM_WRITEV
-            vmw_hits.append(desc)
+            try:
+                tpid = int(ev.get("arg0", "0"), 16)
+            except ValueError:
+                tpid = 0
+            if tpid > 0:
+                vmw_target_pids.add(tpid)
+            elif ev_pid:
+                vmw_target_pids.add(ev_pid)
+            if failed:
+                vmw_failed.append(desc)
+            elif explicit_unverified:
+                vmw_unverified.append(desc)
+            else:
+                vmw_hits.append(desc)
         elif etype == "4":  # SS_EVT_SYSCALL_MEMFD
-            # Flag explicit MFD_EXEC (0x10) unconditionally
             try:
                 fl = int(ev.get("arg1", "0"), 16)
             except ValueError:
                 fl = 0
             if fl & 0x10:
-                memfd_hits.append(desc)
+                if ev_pid:
+                    memfd_pids.add(ev_pid)
+                if failed:
+                    memfd_failed.append(desc)
+                elif explicit_unverified:
+                    memfd_unverified.append(desc)
+                else:
+                    memfd_hits.append(desc)
         elif etype == "5":  # SS_EVT_SYSCALL_EXECVEAT
             try:
                 fl = int(ev.get("arg1", "0"), 16)
             except ValueError:
                 fl = 0
             if fl & 0x1000:  # AT_EMPTY_PATH fileless memfd/fd execution
-                execveat_hits.append(desc)
+                if comm in benign_execveat_comms and not any(d in detail for d in ("memfd:", "/dev/shm/", "/tmp/")):
+                    continue
+                if ev_pid:
+                    execveat_pids.add(ev_pid)
+                if failed:
+                    execveat_failed.append(desc)
+                elif explicit_unverified:
+                    execveat_unverified.append(desc)
+                else:
+                    execveat_hits.append(desc)
         elif etype == "7":  # SS_EVT_SYSCALL_BPF
             if comm.lower() in benign_bpf_comms:
                 continue
@@ -1239,18 +1457,41 @@ def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
             except ValueError:
                 cmd = -1
             if cmd in (5, 28, 32):  # BPF_PROG_LOAD, BPF_LINK_CREATE, BPF_ITER_CREATE
-                bpf_hits.append(desc)
+                if ev_pid:
+                    bpf_pids.add(ev_pid)
+                if failed:
+                    bpf_failed.append(desc)
+                elif explicit_unverified:
+                    bpf_unverified.append(desc)
+                else:
+                    bpf_hits.append(desc)
         elif etype == "8":  # SS_EVT_SYSCALL_IOPL
             if comm not in ("Xorg", "Xwayland"):
-                iopl_hits.append(desc)
+                if ev_pid:
+                    iopl_pids.add(ev_pid)
+                if failed:
+                    iopl_failed.append(desc)
+                elif explicit_unverified:
+                    iopl_unverified.append(desc)
+                else:
+                    iopl_hits.append(desc)
         elif etype in ("6", "10"):  # MOD_LOAD / MODULE_NOTIFY
-            if "mc_ss_kmod" not in desc:
+            if "mc_ss_kmod" not in desc and not failed:
                 mod_hits.append(desc)
         elif etype == "11":  # INPUT_REGISTER
             if ev.get("arg0") == "0x6":  # BUS_VIRTUAL
+                if ev_pid:
+                    uinput_pids.add(ev_pid)
                 uinput_hits.append(desc)
         elif etype == "12":  # SS_EVT_SYSCALL_UINPUT_CREATE (UI_DEV_CREATE ioctl)
-            uinput_hits.append(desc)
+            if ev_pid:
+                uinput_pids.add(ev_pid)
+            if failed:
+                uinput_failed.append(desc)
+            elif explicit_unverified:
+                uinput_unverified.append(desc)
+            else:
+                uinput_hits.append(desc)
 
     if vmw_hits:
         ctx.add_finding(
@@ -1262,7 +1503,36 @@ def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
                 category="Ring-0 Runtime Syscall Trace",
                 title="Tarama sırasında canlı process_vm_writev bellek yazma çağrısı yakalandı!",
                 description="Harici bir süreç başka bir sürecin RAM alanına doğrudan yazma girişiminde bulundu.",
+                pid=next(iter(vmw_target_pids)) if len(vmw_target_pids) == 1 else None,
                 evidence=vmw_hits[:10],
+            )
+        )
+    elif vmw_unverified:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-VM-WRITEV-INJECT",
+                engine=ENGINE_NAME,
+                severity=Severity.MEDIUM,
+                confidence=Confidence.MEDIUM,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında sys_exit eşleşmesi olmayan process_vm_writev girişimi gözlemlendi",
+                description="sys_enter üzerinde process_vm_writev çağrısı görüldü ancak dönüş durumu pencere içinde doğrulanamadı (has_ret=0).",
+                pid=next(iter(vmw_target_pids)) if len(vmw_target_pids) == 1 else None,
+                evidence=vmw_unverified[:10],
+            )
+        )
+    elif vmw_failed:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-VM-WRITEV-INJECT",
+                engine=ENGINE_NAME,
+                severity=Severity.MEDIUM,
+                confidence=Confidence.MEDIUM,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında başarısız/engellenmiş process_vm_writev denemesi yakalandı",
+                description="Çekirdek bellek yazma çağrısı sys_exit üzerinde hata koduyla sonlandı (örn. EPERM/EACCES).",
+                pid=next(iter(vmw_target_pids)) if len(vmw_target_pids) == 1 else None,
+                evidence=vmw_failed[:10],
             )
         )
     if ptrace_hits:
@@ -1275,7 +1545,36 @@ def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
                 category="Ring-0 Runtime Syscall Trace",
                 title="Tarama sırasında aktif ptrace müdahale çağrısı yakalandı",
                 description="Çekirdek sys_enter tracepoint'i tanınmayan süreçten gelen ptrace çağrısı kaydetti.",
+                pid=next(iter(ptrace_pids)) if len(ptrace_pids) == 1 else None,
                 evidence=ptrace_hits[:10],
+            )
+        )
+    elif ptrace_unverified:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-PTRACE-INJECT",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.LOW,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında sys_exit eşleşmesi olmayan ptrace çağrısı gözlemlendi",
+                description="ptrace giriş olayı yakalandı ancak dönüş durumu doğrulanamadı (has_ret=0).",
+                pid=next(iter(ptrace_pids)) if len(ptrace_pids) == 1 else None,
+                evidence=ptrace_unverified[:10],
+            )
+        )
+    elif ptrace_failed:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-PTRACE-INJECT",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.LOW,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında başarısız/engellenmiş ptrace denemesi gözlendi",
+                description="sys_exit tracepoint'i ptrace çağrısının başarısız döndüğünü kaydetti.",
+                pid=next(iter(ptrace_pids)) if len(ptrace_pids) == 1 else None,
+                evidence=ptrace_failed[:10],
             )
         )
     if memfd_hits:
@@ -1288,7 +1587,36 @@ def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
                 category="Ring-0 Runtime Syscall Trace",
                 title="Tarama sırasında şüpheli memfd_create (dosyasız RAM dosyası) çağrısı",
                 description="MFD_EXEC veya şüpheli süreç bağlamında bellek içi yürütme hazırlığı gözlendi.",
+                pid=next(iter(memfd_pids)) if len(memfd_pids) == 1 else None,
                 evidence=memfd_hits[:10],
+            )
+        )
+    elif memfd_unverified:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-MEMFD-EXEC",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.LOW,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında doğrulanamayan memfd_create MFD_EXEC çağrısı",
+                description="memfd_create çağrısının sys_exit dönüşü yakalanamadı (has_ret=0).",
+                pid=next(iter(memfd_pids)) if len(memfd_pids) == 1 else None,
+                evidence=memfd_unverified[:10],
+            )
+        )
+    elif memfd_failed:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-MEMFD-EXEC",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.LOW,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında başarısız memfd_create MFD_EXEC denemesi",
+                description="Dosyasız yürütülebilir bellek dosyası oluşturma çağrısı hata kodu döndürdü.",
+                pid=next(iter(memfd_pids)) if len(memfd_pids) == 1 else None,
+                evidence=memfd_failed[:10],
             )
         )
     if uinput_hits:
@@ -1301,7 +1629,36 @@ def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
                 category="Ring-0 Input Trace",
                 title="Tarama sırasında çekirdekte canlı sanal /dev/uinput cihazı oluşturuldu!",
                 description="input_register_device(BUS_VIRTUAL) canlı makro/enjeksiyon cihazı açılışı kaydetti.",
+                pid=next(iter(uinput_pids)) if len(uinput_pids) == 1 else None,
                 evidence=uinput_hits[:10],
+            )
+        )
+    elif uinput_unverified:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-LIVE-UINPUT-CREATED",
+                engine=ENGINE_NAME,
+                severity=Severity.MEDIUM,
+                confidence=Confidence.MEDIUM,
+                category="Ring-0 Input Trace",
+                title="Tarama sırasında doğrulanamayan UI_DEV_CREATE ioctl çağrısı gözlemlendi",
+                description="uinput oluşturma ioctl girişi görüldü ancak dönüş durumu doğrulanamadı (has_ret=0).",
+                pid=next(iter(uinput_pids)) if len(uinput_pids) == 1 else None,
+                evidence=uinput_unverified[:10],
+            )
+        )
+    elif uinput_failed:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-LIVE-UINPUT-CREATED",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.LOW,
+                category="Ring-0 Input Trace",
+                title="Tarama sırasında başarısız/reddedilen uinput cihaz oluşturma denemesi",
+                description="UI_DEV_CREATE ioctl çağrısı sys_exit üzerinde hata kodu döndürdü.",
+                pid=next(iter(uinput_pids)) if len(uinput_pids) == 1 else None,
+                evidence=uinput_failed[:10],
             )
         )
     if mod_hits:
@@ -1327,7 +1684,36 @@ def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
                 category="Ring-0 Runtime Syscall Trace",
                 title="Tarama sırasında dosya tanıtıcısı (execveat AT_EMPTY_PATH) üzerinden dosyasız yürütme yakalandı!",
                 description="memfd/O_PATH tanıtıcısı üzerinden doğrudan çekirdek düzeyinde yürütme çağrısı yapıldı.",
+                pid=next(iter(execveat_pids)) if len(execveat_pids) == 1 else None,
                 evidence=execveat_hits[:10],
+            )
+        )
+    elif execveat_unverified:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-EXECVEAT-FILELESS",
+                engine=ENGINE_NAME,
+                severity=Severity.MEDIUM,
+                confidence=Confidence.LOW,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında dönüşü doğrulanamayan execveat AT_EMPTY_PATH çağrısı",
+                description="sys_enter üzerinde execveat AT_EMPTY_PATH görüldü ancak sys_exit kaydedilmedi (has_ret=0).",
+                pid=next(iter(execveat_pids)) if len(execveat_pids) == 1 else None,
+                evidence=execveat_unverified[:10],
+            )
+        )
+    elif execveat_failed:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-EXECVEAT-FILELESS",
+                engine=ENGINE_NAME,
+                severity=Severity.MEDIUM,
+                confidence=Confidence.LOW,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında başarısız execveat AT_EMPTY_PATH denemesi",
+                description="Dosya tanıtıcısı üzerinden yürütme çağrısı sys_exit üzerinde hata koduyla sonlandı.",
+                pid=next(iter(execveat_pids)) if len(execveat_pids) == 1 else None,
+                evidence=execveat_failed[:10],
             )
         )
     if bpf_hits:
@@ -1340,7 +1726,36 @@ def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
                 category="Ring-0 Runtime Syscall Trace",
                 title="Tarama sırasında tanınmayan süreçten canlı bpf() program yükleme/bağlama çağrısı yakalandı",
                 description="sys_enter tracepoint'i tarama penceresinde BPF_PROG_LOAD/BPF_LINK_CREATE işlemi kaydetti.",
+                pid=next(iter(bpf_pids)) if len(bpf_pids) == 1 else None,
                 evidence=bpf_hits[:10],
+            )
+        )
+    elif bpf_unverified:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-LIVE-BPF-LOAD",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.LOW,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında dönüşü doğrulanamayan bpf() program yükleme girişimi",
+                description="bpf() sys_enter olayı yakalandı ancak sys_exit kaydedilmedi (has_ret=0).",
+                pid=next(iter(bpf_pids)) if len(bpf_pids) == 1 else None,
+                evidence=bpf_unverified[:10],
+            )
+        )
+    elif bpf_failed:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-LIVE-BPF-LOAD",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.LOW,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında reddedilen bpf() program yükleme denemesi gözlendi",
+                description="Yetkisiz veya hata ile sonlanan bpf() çağrısı kaydedildi.",
+                pid=next(iter(bpf_pids)) if len(bpf_pids) == 1 else None,
+                evidence=bpf_failed[:10],
             )
         )
     if iopl_hits:
@@ -1353,9 +1768,48 @@ def _analyze_live_events(ctx: ScanContext, events_txt: str) -> None:
                 category="Ring-0 Runtime Syscall Trace",
                 title="Tarama sırasında ham donanım port erişimi (iopl/ioperm) çağrısı yakalandı!",
                 description="Kullanıcı alanı süreci donanım I/O portlarına doğrudan erişim yetkisi istedi.",
+                pid=next(iter(iopl_pids)) if len(iopl_pids) == 1 else None,
                 evidence=iopl_hits[:10],
             )
         )
+    elif iopl_unverified:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-RAW-IO-PORT",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.LOW,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında dönüşü doğrulanamayan ham I/O port (iopl/ioperm) çağrısı",
+                description="iopl/ioperm çağrısının sys_exit dönüşü yakalanamadı (has_ret=0).",
+                pid=next(iter(iopl_pids)) if len(iopl_pids) == 1 else None,
+                evidence=iopl_unverified[:10],
+            )
+        )
+    elif iopl_failed:
+        ctx.add_finding(
+            Finding(
+                rule_id="E9-EVT-RAW-IO-PORT",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.LOW,
+                category="Ring-0 Runtime Syscall Trace",
+                title="Tarama sırasında başarısız ham I/O port erişim (iopl/ioperm) denemesi",
+                description="Donanım portu erişim çağrısı hata kodu döndürdü.",
+                pid=next(iter(iopl_pids)) if len(iopl_pids) == 1 else None,
+                evidence=iopl_failed[:10],
+            )
+        )
+
+
+_SAFE_QMK_KEYBOARD_RE = re.compile(
+    r"(qmk|via|keychron|planck|preonic|moonlander|ergodox|voyager|zsa|dactyl|iris|corne|lily58|kinesis)",
+    re.IGNORECASE,
+)
+
+
+def _snap_is_read_err(txt: str) -> bool:
+    return bool(txt) and txt.lstrip().startswith("READ_ERR|")
 
 
 def _analyze_kernel_surface_sysfs(ctx: ScanContext, root_extras: dict[str, Any]) -> None:
@@ -1433,19 +1887,40 @@ def _analyze_kernel_surface_sysfs(ctx: ScanContext, root_extras: dict[str, Any])
                 explicit_macro_kw = bool(
                     re.search(r"(kmbox|makcu|badusb|hid-gadget|ch552)", combined, re.IGNORECASE)
                 )
+                high_risk_hid_mcu = explicit_macro_kw or bool(
+                    re.search(r"(leonardo|pro micro|teensy|digispark|rubber ducky)", combined, re.IGNORECASE)
+                )
+                is_standard_qmk = bool(_SAFE_QMK_KEYBOARD_RE.search(combined)) and not explicit_macro_kw
                 # Ignore pure UART/storage cables on real Linux sysfs unless HID (03) or explicit BadUSB/KMBox
                 if (vid in _USB_MACRO_MCU_VENDORS or _USB_MACRO_KW_RE.search(combined)) and (
                     has_hid_iface or not iface_classes or explicit_macro_kw
                 ):
+                    if is_standard_qmk:
+                        mcu_sev = Severity.LOW
+                        mcu_conf = Confidence.LOW
+                    elif high_risk_hid_mcu:
+                        mcu_sev = Severity.HIGH
+                        mcu_conf = Confidence.HIGH
+                    else:
+                        mcu_sev = Severity.MEDIUM if has_hid_iface else Severity.LOW
+                        mcu_conf = Confidence.MEDIUM if has_hid_iface else Confidence.LOW
                     ctx.add_finding(
                         Finding(
                             rule_id="E9-HW-USB-MACRO-MCU",
                             engine=ENGINE_NAME,
-                            severity=Severity.HIGH,
-                            confidence=Confidence.HIGH,
+                            severity=mcu_sev,
+                            confidence=mcu_conf,
                             category="Hardware Macro / BadUSB",
-                            title=f"Programlanabilir USB mikrodenetleyici / donanım makro cihazı bağlı: {prod or vid + ':' + pid}",
-                            description="Arduino/Teensy/RP2040/HID köprüsü donanım düzeyinde tıklama ve aim makrosu enjekte edebilir.",
+                            title=(
+                                f"Programlanabilir QMK/VIA klavye kontrolcüsü algılandı: {prod or vid + ':' + pid}"
+                                if is_standard_qmk
+                                else f"Programlanabilir USB mikrodenetleyici / donanım makro cihazı bağlı: {prod or vid + ':' + pid}"
+                            ),
+                            description=(
+                                "Özel firmware destekli mekanik klavye kontrolcüsü tespit edildi (tek başına hile kanıtı değildir)."
+                                if is_standard_qmk
+                                else "Arduino/Teensy/RP2040/HID köprüsü donanım düzeyinde tıklama ve aim makrosu enjekte edebilir."
+                            ),
                             path=str(dev),
                             evidence=[
                                 f"VID:PID={vid}:{pid} ({_USB_MACRO_MCU_VENDORS.get(vid, 'Özel Üretici')})",
@@ -1462,15 +1937,16 @@ def _analyze_kernel_surface_sysfs(ctx: ScanContext, root_extras: dict[str, Any])
         try:
             vfio_nodes = [p.name for p in vfio_dir.iterdir() if p.name not in ("vfio",)]
             if vfio_nodes:
+                ctx.telemetry["vfio_groups"] = sorted(vfio_nodes)
                 ctx.add_finding(
                     Finding(
                         rule_id="E9-DMA-VFIO-ACTIVE-NODE",
                         engine=ENGINE_NAME,
-                        severity=Severity.HIGH,
+                        severity=Severity.MEDIUM,
                         confidence=Confidence.HIGH,
                         category="DMA & IOMMU Hardware Protection",
                         title=f"Aktif /dev/vfio aygıt düğümü tespit edildi ({len(vfio_nodes)} grup)",
-                        description="PCIe aygıtı VFIO DMA passthrough grubu olarak açılmış.",
+                        description="PCIe aygıtı VFIO DMA passthrough grubu olarak açılmış (Sanal makine GPU passthrough veya DMA erişimi).",
                         path=str(vfio_dir),
                         evidence=[f"/dev/vfio/{n}" for n in vfio_nodes[:10]],
                     )
@@ -1617,10 +2093,10 @@ def _analyze_kernel_surface_sysfs(ctx: ScanContext, root_extras: dict[str, Any])
         )
 
 
-def _run_unprivileged_native_probe(ctx: ScanContext) -> dict[str, Any]:
+def _run_unprivileged_native_probe(ctx: ScanContext) -> tuple[dict[str, Any], str]:
     probe = priv_helper.find_native_probe()
     if not probe:
-        return {}
+        return {}, "ss_kernel_probe not found or untrusted"
     try:
         cp = subprocess.run(
             [str(probe), "all"],
@@ -1628,12 +2104,15 @@ def _run_unprivileged_native_probe(ctx: ScanContext) -> dict[str, Any]:
             text=True,
             timeout=10,
             check=False,
+            env=priv_helper._clean_priv_env(),
         )
         if cp.stdout.strip():
-            return json.loads(cp.stdout)
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        pass
-    return {}
+            data = json.loads(cp.stdout)
+            if isinstance(data, dict):
+                return data, "" if cp.returncode == 0 else f"rc={cp.returncode}"
+        return {}, (cp.stderr or f"empty output rc={cp.returncode}").strip()
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return {}, str(exc)
 
 
 def run(ctx: ScanContext) -> None:
@@ -1656,25 +2135,82 @@ def run(ctx: ScanContext) -> None:
     elif ctx.live_mode and str(ctx.root_prefix) == "/":
         enable_lkm = getattr(ctx, "enable_kernel_lkm", False)
         if enable_lkm or os.geteuid() == 0:
-            emit_scan_progress(ctx, 0.20, "Yetkili Ring-0 sürücüsü yükleniyor ve çekirdek taranıyor...")
+            emit_scan_progress(
+                ctx,
+                0.20,
+                "Yetkili Ring-0 sürücüsü yükleniyor ve çekirdek taranıyor..."
+                if enable_lkm
+                else "Root düzeyinde native C probe / eBPF çekirdek yüzeyi taranıyor...",
+            )
             ring0_data = priv_helper.collect_privileged_kernel_snapshot(
                 trace_window_ms=getattr(ctx, "kernel_trace_ms", 1500),
                 allow_pkexec=enable_lkm,
                 target_os=target_os,
+                load_lkm=enable_lkm,
             )
 
     proc_snaps = ring0_data.get("proc_snapshots") or {}
     root_extras = ring0_data.get("root_extras") or {}
-    native_probe = root_extras.get("native_probe") or (
-        _run_unprivileged_native_probe(ctx) if (ctx.live_mode and str(ctx.root_prefix) == "/") else {}
-    )
+    probe_err = str(root_extras.get("native_probe_error", "") or "")
+    native_probe = root_extras.get("native_probe")
+    if not native_probe and (ctx.live_mode and str(ctx.root_prefix) == "/"):
+        native_probe, unpriv_err = _run_unprivileged_native_probe(ctx)
+        if unpriv_err and not probe_err:
+            probe_err = unpriv_err
+    native_probe = native_probe or {}
+
+    if probe_err:
+        ctx.set_coverage("E9.native_probe", ScanStatus.ERROR, probe_err)
+    elif native_probe:
+        ctx.set_coverage("E9.native_probe", ScanStatus.COMPLETED, "C telemetry collected")
+    else:
+        ctx.set_coverage(
+            "E9.native_probe",
+            ScanStatus.SKIPPED if not ctx.live_mode else ScanStatus.UNSUPPORTED,
+            "Native C probe not run",
+        )
 
     lkm_loaded = bool(ring0_data.get("lkm_loaded"))
     ctx.telemetry["kernel_lkm_active"] = lkm_loaded
     ctx.telemetry["kernel_lkm_unloaded_cleanly"] = ring0_data.get("lkm_unloaded_cleanly", True)
 
-    if not lkm_loaded and getattr(ctx, "enable_kernel_lkm", False):
-        reason = ring0_data.get("lkm_error") or ring0_data.get("error") or "Modül yüklenemedi"
+    if lkm_loaded:
+        read_errs: list[str] = []
+        for node in ("status", "integrity", "tasks_vma", "pci_iommu", "events"):
+            raw_snap = str(proc_snaps.get(node, "") or "")
+            if _snap_is_read_err(raw_snap):
+                read_errs.append(f"{node}: {raw_snap}")
+                ctx.set_coverage(f"E9.lkm.{node}", ScanStatus.ERROR, raw_snap)
+            elif node != "events" and not raw_snap.strip():
+                ctx.set_coverage(f"E9.lkm.{node}", ScanStatus.PARTIAL, "empty snapshot")
+            else:
+                ctx.set_coverage(f"E9.lkm.{node}", ScanStatus.COMPLETED, "snapshot read ok")
+        if read_errs:
+            ctx.set_coverage("E9.lkm", ScanStatus.PARTIAL, "; ".join(read_errs))
+            ctx.add_finding(
+                Finding(
+                    rule_id="E9-LKM-SNAPSHOT-INCOMPLETE",
+                    engine=ENGINE_NAME,
+                    severity=Severity.MEDIUM,
+                    confidence=Confidence.CONFIRMED,
+                    category="Kernel Scan Coverage",
+                    title="Ring-0 LKM anlık görüntü dosyalarından bazıları eksik veya okunamadı",
+                    description="Çekirdek modülü yüklendi ancak /proc/mc_ss_sentinel altındaki bazı telemetri düğümleri okunamadı.",
+                    evidence=read_errs,
+                )
+            )
+        elif ring0_data.get("lkm_unloaded_cleanly") is False:
+            ctx.set_coverage("E9.lkm", ScanStatus.PARTIAL, "Unload verification failed")
+        else:
+            ctx.set_coverage("E9.lkm", ScanStatus.COMPLETED, "Ring-0 LKM full snapshot verified")
+    elif getattr(ctx, "enable_kernel_lkm", False):
+        reason = str(ring0_data.get("lkm_error") or ring0_data.get("error") or "Modül yüklenemedi")
+        if ring0_data.get("declined"):
+            ctx.set_coverage("E9.lkm", ScanStatus.PERMISSION_DENIED, reason)
+        elif any(tok in reason.lower() for tok in ("headers", "vermagic", "modules_disabled", "clang", "gcc")):
+            ctx.set_coverage("E9.lkm", ScanStatus.UNSUPPORTED, reason)
+        else:
+            ctx.set_coverage("E9.lkm", ScanStatus.ERROR, reason)
         ctx.add_finding(
             Finding(
                 rule_id="E9-LKM-UNPRIVILEGED-FALLBACK",
@@ -1690,6 +2226,8 @@ def run(ctx: ScanContext) -> None:
                 evidence=[f"Neden: {reason}"],
             )
         )
+    else:
+        ctx.set_coverage("E9.lkm", ScanStatus.SKIPPED, "Ring-0 LKM mode disabled")
 
     if lkm_loaded and ring0_data.get("lkm_unloaded_cleanly") is False:
         ctx.add_finding(
@@ -1706,19 +2244,26 @@ def run(ctx: ScanContext) -> None:
         )
 
     emit_scan_progress(ctx, 0.45, "Ring-0 çekirdek bütünlüğü, VFS & kancalar analiz ediliyor...")
-    modinfos = _analyze_ring0_integrity(ctx, proc_snaps.get("integrity", ""))
-    _analyze_lkm_status_and_taint(ctx, proc_snaps.get("status", ""), modinfos)
+    integ_txt = "" if _snap_is_read_err(proc_snaps.get("integrity", "")) else proc_snaps.get("integrity", "")
+    status_txt = "" if _snap_is_read_err(proc_snaps.get("status", "")) else proc_snaps.get("status", "")
+    tasks_txt = "" if _snap_is_read_err(proc_snaps.get("tasks_vma", "")) else proc_snaps.get("tasks_vma", "")
+    pci_txt = "" if _snap_is_read_err(proc_snaps.get("pci_iommu", "")) else proc_snaps.get("pci_iommu", "")
+    events_txt = "" if _snap_is_read_err(proc_snaps.get("events", "")) else proc_snaps.get("events", "")
+
+    modinfos = _analyze_ring0_integrity(ctx, integ_txt)
+    _analyze_lkm_status_and_taint(ctx, status_txt, modinfos)
 
     emit_scan_progress(ctx, 0.65, "Ring-0 süreç ağacı ve VMA bellek baytları taranıyor...")
-    _analyze_ring0_tasks_and_vmas(ctx, proc_snaps.get("tasks_vma", ""))
+    _analyze_ring0_tasks_and_vmas(ctx, tasks_txt)
 
     emit_scan_progress(ctx, 0.80, "PCIe 4KB config uzayı, DMA ve IOMMU koruması denetleniyor...")
     native_pci_ext = native_probe.get("pci_ext") or []
-    _analyze_dma_pci_iommu(ctx, proc_snaps.get("pci_iommu", ""), native_pci_ext)
+    _analyze_dma_pci_iommu(ctx, pci_txt, native_pci_ext)
 
     emit_scan_progress(ctx, 0.92, "eBPF programları, canlı trace olayları ve USB donanımlar taranıyor...")
     _analyze_ebpf_and_pid_cross(ctx, native_probe, root_extras=root_extras)
-    _analyze_live_events(ctx, proc_snaps.get("events", ""))
+    _analyze_live_events(ctx, events_txt)
     _analyze_kernel_surface_sysfs(ctx, root_extras)
 
+    ctx.set_coverage("E9.sysfs", ScanStatus.COMPLETED, "sysfs/procfs hardware & surface checks complete")
     emit_scan_progress(ctx, 1.0, "Engine 9 Kernel & DMA/IOMMU analizi tamamlandı.")

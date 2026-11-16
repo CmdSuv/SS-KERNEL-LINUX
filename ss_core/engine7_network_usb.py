@@ -8,7 +8,7 @@ import socket
 import struct
 from pathlib import Path
 
-from .models import Confidence, Finding, ScanContext, Severity
+from .models import Confidence, Finding, ScanContext, ScanStatus, Severity
 from .signatures import CHEAT_DOMAINS
 from .utils import emit_scan_progress, record_scan_region, run_trusted_cmd, safe_read_text
 
@@ -389,7 +389,7 @@ def _check_usb_devices_and_history(ctx: ScanContext) -> None:
             usb_events: list[str] = []
             for ln in jout.splitlines():
                 low = ln.lower()
-                if any(k in low for k in ("usb-storage", "usb mass storage", "attached scsi removable disk", "usb disconnect")):
+                if any(k in low for k in ("usb-storage", "usb mass storage", "attached scsi removable disk")):
                     usb_events.append(ln.strip()[:200])
             if usb_events:
                 ctx.add_finding(
@@ -399,7 +399,7 @@ def _check_usb_devices_and_history(ctx: ScanContext) -> None:
                         severity=Severity.HIGH,
                         confidence=Confidence.HIGH,
                         category="Recent USB Connect/Disconnect",
-                        title=f"Son {hours} saat icinde USB depolama / baglanti kesme olayi",
+                        title=f"Son {hours} saat icinde USB depolama tak-cikar olayi",
                         description="Kontrol oncesi USB bellek takilip hile calistirildiktan sonra cikarilmis olabilir.",
                         evidence=usb_events[:12],
                     )
@@ -420,6 +420,10 @@ def run(ctx: ScanContext) -> None:
         emit_scan_progress(ctx, 0.90, "USB aygitlari ve tak-cikar gecmisi kontrol ediliyor...")
         _check_usb_devices_and_history(ctx)
         record_scan_region(ctx, "E7", f"{ctx.sys_path('/sys/bus/usb/devices')} ve USB kayitlari")
+        ctx.set_coverage("E7.network_usb", ScanStatus.COMPLETED, "Sockets, proxies, hosts, USB audited")
         emit_scan_progress(ctx, 1.0, "Ag ve USB analizi tamamlandi.")
     except Exception as exc:
+        if exc.__class__.__name__ == "ScanCancelledError":
+            raise
+        ctx.set_coverage("E7.network_usb", ScanStatus.ERROR, str(exc))
         ctx.add_error(ENGINE_NAME, f"Beklenmeyen hata: {exc}")

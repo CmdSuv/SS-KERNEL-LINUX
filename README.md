@@ -9,16 +9,16 @@
 
 ## Nedir?
 
-**MC SS Sentinel**, Linux sistemlerde Minecraft (ve genel sistem/girdi/bellek düzeyi hileleri) için tasarlanmış, tamamen **yerel (offline)** çalışan, salt-okunur çok katmanlı adli kontrol (SS) aracıdır.
+**MC SS Sentinel**, Linux sistemlerde Minecraft (ve genel sistem/girdi/bellek düzeyi hileleri) için tasarlanmış, tamamen **yerel (offline)** çalışan, tarama motorları bütünüyle **salt-okunur** olan çok katmanlı adli kontrol (SS) aracıdır (yalnızca kullanıcı tarafından açıkça onaylanan *IOMMU/DMA Korumasını Aç* özelliği önyükleyici parametrelerine `.mc_ss_sentinel.bak` yedeği alarak yazar).
 
-Klasik yalnızca dosya adına bakan araçların aksine kullanıcı izniyle çalışan **9 bağımsız analiz motorunu**, **yerel C sondasını (`ss_kernel_probe`)** ve geçici **"Gir-Tara-Çık" Ring-0 Linux Çekirdek Modülünü (`mc_ss_kmod.ko`)** bir araya getirir.
+Klasik yalnızca dosya adına bakan araçların aksine kullanıcı izniyle çalışan **9 bağımsız analiz motorunu**, **yerel C sondasını (`ss_kernel_probe`)** ve x86_64 çekirdekler için geçici **"Gir-Tara-Çık" Ring-0 Linux Çekirdek Modülünü (`mc_ss_kmod.ko`)** bir araya getirir.
 
 ---
 
 ## Öne Çıkan Özellikler
 
 - **%100 Yerel ve Açık Rıza Kapılı:** Dış sunucuya veri göndermez. Açılışta en alta kaydırılmadan onaylanmayan **Açık Rıza Sözleşmesi** ve ardından **İşletim Sistemi Profil Seçici** açılır.
-- **Sade ve Anlaşılır Raporlama:** Tarama bitiminde Masaüstüne (`MC_SS_Raporu_*.txt`) anlaşılır Türkçe yönetici özeti, önem derecesine göre gruplanmış kanıt kartları (`2A Kritik/Yüksek`, `2B Orta`, `2C Düşük/Bilgi`), sadeleştirilmiş Sistem/Ring-0 tablosu ve SHA-256 bütünlük doğrulaması yazar.
+- **Sade ve Anlaşılır Raporlama:** Tarama bitiminde Masaüstüne (`MC_SS_Raporu_*.txt`) anlaşılır Türkçe yönetici özeti, 6 ayrı risk alanı ayrımı (Hile Kanıtı, Adli Manipülasyon, Çekirdek Bütünlüğü, DMA/Donanım, Sistem Güvenliği, Tarama Kapsamı), önem derecesine göre gruplanmış kanıt kartları (`2A Kritik/Yüksek`, `2B Orta`, `2C Düşük/Bilgi`), sadeleştirilmiş Sistem/Ring-0 tablosu ve SHA-256 bütünlük doğrulaması yazar.
 - **Ekran Paylaşımı (SS) Dostu Arayüz:** Tarama tamamlandığında arayüzde kırmızı risk/karar metni göstermez; yalnızca raporun masaüstüne kaydedildiğini bildirir.
 - **7 Büyük Linux Dağıtımı İçin Özel Profiller ve Derleme Desteği:**
   - `bazzite` — Bazzite / Fedora Atomic (`rpm-ostree`)
@@ -42,8 +42,8 @@ Klasik yalnızca dosya adına bakan araçların aksine kullanıcı izniyle çal�
 | **E5 — Minecraft İzleri** | Vanilla & tüm launcher profilleri (Prism, Lunar, Modrinth, HMCL, Wine/Proton), `options.txt`, oyun logları, `hs_err_pid` |
 | **E6 — Masaüstü & Tarayıcı** | `recently-used.xbel`, pano/Klipper, Çöp Kutusu, tarayıcı SQLite geçmiş + WAL + freelist kalıntıları, Wine `user.reg` UserAssist, `.java/.userPrefs` |
 | **E7 — Ağ & USB** | `/proc/net` soketleri, VPN tünelleri, yerel SOCKS/HTTP proxy portları, `/etc/hosts` yönlendirmeleri, USB donanım geçmişi |
-| **E8 — Korelasyon & Raporlama** | Çoklu motor korelasyon kuralları (`WIPE-CHAIN`, `GHOST-RAM`, `JVM-INJECT`, `RING0-ROOTKIT`, `DMA-EXPOSURE` vb.), risk puanlama ve `.txt`/`.html`/`.json` raporları |
-| **E9 — Ring-0 Kernel & eBPF/DMA** | Polkit ile geçici `mc_ss_kmod.ko` (`5.15–7.3+`), `ss_kernel_probe` (`sys_bpf` + `getdents64` gizli PID cross-view + PCIe 4KB config), `ftrace`/syscall/VFS kanca taraması, yetim kernel bellek/VMA bayt taraması ve **IOMMU / DMA** koruması |
+| **E8 — Korelasyon & Raporlama** | Çoklu motor korelasyon kuralları (`WIPE-CHAIN`, `GHOST-RAM`, `JVM-INJECT`, `RING0-ROOTKIT`, `DMA-EXPOSURE` vb.), 6 alanlı açıklanabilir puanlama ve `.txt`/`.html`/`.json`/`.sha256` raporları |
+| **E9 — Ring-0 Kernel & eBPF/DMA** | Polkit ile x86_64 çekirdeklerde geçici `mc_ss_kmod.ko` (`5.15–7.3+`), `ss_kernel_probe` (`sys_bpf` + `getdents64` gizli PID cross-view + PCIe 4KB config), `ftrace`/syscall/VFS kanca taraması, yetim kernel bellek/VMA bayt taraması ve **IOMMU / DMA** koruması |
 
 ---
 
@@ -59,7 +59,7 @@ mc-ss-forensics/
 ├── assets/                     # Uygulama simgesi ve UI görselleri
 ├── packaging/                  # 7 dağıtım için Containerfile/Dockerfile, build_inside_container.sh, doğrulayıcı
 ├── scripts/                    # Çoklu hedef container derleme yöneticisi (build_distro_targets.py)
-├── tests/                      # 61 birim ve entegrasyon testi
+├── tests/                      # 80 birim ve entegrasyon testi
 ├── launch_ss_sentinel.sh       # Terminal tabanlı hızlı başlatıcı
 ├── LICENSE                     # Zorunlu Atıf, Ticari Olmayan & Değişmez Lisans (+ kernel/ GPL-2.0 notu)
 └── README.md

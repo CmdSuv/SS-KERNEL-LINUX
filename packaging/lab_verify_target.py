@@ -26,7 +26,7 @@ def main() -> int:
 
     # 1. Verify native C probe execution
     probe = work_dir / "native/ss_kernel_probe"
-    cp_probe = subprocess.run([str(probe), "pid_cross"], capture_output=True, text=True, check=False)
+    cp_probe = subprocess.run([str(probe), "pid-cross"], capture_output=True, text=True, check=False)
     if cp_probe.returncode != 0:
         print(f"[LAB-ERR] ss_kernel_probe failed: rc={cp_probe.returncode} err={cp_probe.stderr}", file=sys.stderr)
         return 1
@@ -47,9 +47,12 @@ def main() -> int:
         assert cp_mi.returncode == 0 and krel in cp_mi.stdout, f"Bad vermagic for {krel}: {cp_mi.stdout}"
 
         # Now clear cache and verify on-target dynamic builder works end-to-end on clean tree
-        cache_ko = Path.home() / ".local/share/mc-ss-sentinel/kmods" / krel / "mc_ss_kmod.ko"
-        if cache_ko.exists():
-            shutil.rmtree(cache_ko.parent, ignore_errors=True)
+        for cache_ko in (
+            Path("/var/cache/mc-ss-sentinel/kmods") / krel / "mc_ss_kmod.ko",
+            Path.home() / ".local/share/mc-ss-sentinel/kmods" / krel / "mc_ss_kmod.ko",
+        ):
+            if cache_ko.exists():
+                shutil.rmtree(cache_ko.parent, ignore_errors=True)
         # Hide prebuilt temporarily by copying work/kernel without prebuilt
         with tempfile.TemporaryDirectory() as td_k:
             fake_root = Path(td_k)

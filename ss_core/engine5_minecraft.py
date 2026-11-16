@@ -10,7 +10,7 @@ import re
 import zipfile
 from pathlib import Path
 
-from .models import Confidence, Finding, ScanContext, Severity
+from .models import Confidence, Finding, ScanContext, ScanStatus, Severity
 from .utils import (
     discover_minecraft_roots,
     emit_scan_progress,
@@ -18,6 +18,7 @@ from .utils import (
     record_scan_region,
     safe_read_bytes,
     safe_read_text,
+    safe_zip_read,
     statx_timestamps,
 )
 
@@ -121,7 +122,7 @@ def _collect_current_mod_ids(mods_dir: Path) -> set[str]:
             fn_low = info.filename.lower()
             if fn_low in ("fabric.mod.json", "quilt.mod.json"):
                 try:
-                    obj = json.loads(zf.read(info)[:262144].decode("utf-8", errors="replace"))
+                    obj = json.loads(safe_zip_read(zf, info, 262144).decode("utf-8", errors="replace"))
                     if isinstance(obj, dict):
                         if "id" in obj:
                             present.add(str(obj["id"]).lower())
@@ -137,14 +138,14 @@ def _collect_current_mod_ids(mods_dir: Path) -> set[str]:
                     pass
             elif fn_low in ("meta-inf/mods.toml", "meta-inf/neoforge.mods.toml"):
                 try:
-                    raw = zf.read(info)[:262144].decode("utf-8", errors="replace")
+                    raw = safe_zip_read(zf, info, 262144).decode("utf-8", errors="replace")
                     for m in re.finditer(r'modId\s*=\s*["\']([^"\']+)["\']', raw):
                         present.add(m.group(1).lower())
                 except Exception:
                     pass
             elif fn_low == "mcmod.info":
                 try:
-                    obj = json.loads(zf.read(info)[:262144].decode("utf-8", errors="replace"))
+                    obj = json.loads(safe_zip_read(zf, info, 262144).decode("utf-8", errors="replace"))
                     if isinstance(obj, list):
                         for item in obj:
                             if isinstance(item, dict) and "modid" in item:
@@ -153,7 +154,8 @@ def _collect_current_mod_ids(mods_dir: Path) -> set[str]:
                     pass
             elif fn_low.endswith(".jar") and depth < 2 and info.file_size <= 16 * 1024 * 1024:
                 try:
-                    with zipfile.ZipFile(io.BytesIO(zf.read(info))) as nzf:
+                    nested_raw = safe_zip_read(zf, info, 16 * 1024 * 1024)
+                    with zipfile.ZipFile(io.BytesIO(nested_raw)) as nzf:
                         _extract_from_zip(nzf, depth + 1)
                 except Exception:
                     pass
@@ -365,7 +367,8 @@ def _read_log_file_text(lp: Path) -> str:
         if not raw:
             return ""
         try:
-            dec = gzip.decompress(raw)[:8 * 1024 * 1024]
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gzf:
+                dec = gzf.read(8 * 1024 * 1024)
             return dec.decode("utf-8", errors="replace")
         except Exception:
             return ""
@@ -412,19 +415,37 @@ def _inspect_logs_and_crashes(ctx: ScanContext, label: str, inst_dir: Path) -> N
                     )
                 )
 
+    def _safe_mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
     log_files: list[Path] = []
     if logs_dir.is_dir():
         for name in ("latest.log", "debug.log", "fml-client-latest.log"):
             if (logs_dir / name).is_file():
                 log_files.append(logs_dir / name)
-        prism_logs = sorted(logs_dir.glob("PrismLauncher-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:4]
+        prism_logs = sorted(
+            (p for p in logs_dir.glob("PrismLauncher-*.log") if p.is_file()),
+            key=_safe_mtime,
+            reverse=True,
+        )[:4]
         log_files.extend(prism_logs)
         # Inspect up to 8 most recent .log.gz files
-        gz_files = sorted(logs_dir.glob("*.log.gz"), key=lambda p: p.stat().st_mtime, reverse=True)[:8]
+        gz_files = sorted(
+            (p for p in logs_dir.glob("*.log.gz") if p.is_file()),
+            key=_safe_mtime,
+            reverse=True,
+        )[:8]
         log_files.extend(gz_files)
 
     if crashes_dir.is_dir():
-        crash_files = sorted(crashes_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:8]
+        crash_files = sorted(
+            (p for p in crashes_dir.glob("*.txt") if p.is_file()),
+            key=_safe_mtime,
+            reverse=True,
+        )[:8]
         log_files.extend(crash_files)
 
     # hs_err_pid*.log files in instance root
@@ -630,6 +651,10 @@ def run(ctx: ScanContext) -> None:
         emit_scan_progress(ctx, 0.90, "JVM hs_err_pid cokme kayitlari kontrol ediliyor...")
         _inspect_home_hs_err_logs(ctx)
         record_scan_region(ctx, "E5", f"{ctx.home_dir}/hs_err_pid*.log")
+        ctx.set_coverage("E5.minecraft", ScanStatus.COMPLETED, f"{len(instances)} instance(s) audited")
         emit_scan_progress(ctx, 1.0, "Minecraft config ve log dogrulamasi tamamlandi.")
     except Exception as exc:
+        if exc.__class__.__name__ == "ScanCancelledError":
+            raise
+        ctx.set_coverage("E5.minecraft", ScanStatus.ERROR, str(exc))
         ctx.add_error(ENGINE_NAME, f"Beklenmeyen hata: {exc}")

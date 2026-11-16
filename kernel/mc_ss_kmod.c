@@ -27,6 +27,7 @@
 #define pr_fmt(fmt) "mc_ss_kmod: " fmt
 
 #include <linux/atomic.h>
+#include <linux/binfmts.h>
 #include <linux/compat.h>
 #include <linux/cred.h>
 #include <linux/dcache.h>
@@ -65,6 +66,10 @@
 #include <linux/utsname.h>
 #include <linux/version.h>
 #include <linux/vmalloc.h>
+
+#if !defined(CONFIG_X86_64)
+#error "mc_ss_kmod requires Linux x86_64 architecture (MSR_LSTAR, lookup_address, x86 pt_regs)"
+#endif
 
 #include <asm/msr.h>
 #include <asm/msr-index.h>
@@ -140,16 +145,28 @@ static struct ss_target_sym g_integrity_targets[] = {
 	{ "input_event", 0 },
 };
 
-/* Ephemeral live ring-buffer */
+/* Ephemeral live ring-buffer + sys_enter/sys_exit correlation */
+struct ss_inflight_slot {
+	bool active;
+	pid_t pid;
+	long syscall_nr;
+	unsigned int ring_seq;
+};
+
 static struct ss_kprobe_event *g_event_ring;
+static unsigned int g_ring_slot_seq[SS_EVENT_RING_CAP];
+static struct ss_inflight_slot g_inflight[SS_INFLIGHT_CAP];
 static DEFINE_RAW_SPINLOCK(g_ring_lock);
 static unsigned int g_ring_write_idx;
+static atomic_t g_inflight_cnt = ATOMIC_INIT(0);
 static atomic64_t g_ring_total_events = ATOMIC64_INIT(0);
 
 /* Active tracepoint / kprobe / notifier registration state */
 static struct tracepoint *g_tp_sys_enter;
+static struct tracepoint *g_tp_sys_exit;
 static struct tracepoint *g_tp_sched_exec;
 static bool g_tp_sys_enter_active;
+static bool g_tp_sys_exit_active;
 static bool g_tp_sched_exec_active;
 static bool g_kp_input_active;
 static bool g_mod_notifier_active;
@@ -285,21 +302,26 @@ static bool ss_pid_in_event_ring(pid_t tgid)
 	return found;
 }
 
-static void ss_push_event(enum ss_event_type type, unsigned long arg0,
-			  unsigned long arg1, const char *detail)
+static void ss_push_event_track(enum ss_event_type type, unsigned long arg0,
+				unsigned long arg1, const char *detail,
+				bool track_exit, long syscall_nr)
 {
 	unsigned long flags;
 	struct ss_kprobe_event *slot;
 	unsigned int idx;
+	unsigned int seq;
 
 	if (!g_event_ring)
 		return;
 
 	raw_spin_lock_irqsave(&g_ring_lock, flags);
-	idx = g_ring_write_idx % SS_EVENT_RING_CAP;
+	seq = g_ring_write_idx;
+	idx = seq % SS_EVENT_RING_CAP;
 	g_ring_write_idx++;
+	g_ring_slot_seq[idx] = seq;
 	slot = &g_event_ring[idx];
 	slot->ts_ns = ktime_get_boottime_ns();
+	slot->start_ns = current->start_boottime;
 	slot->type = (u32)type;
 	slot->pid = current->pid;
 	slot->tgid = current->tgid;
@@ -308,10 +330,60 @@ static void ss_push_event(enum ss_event_type type, unsigned long arg0,
 	slot->comm[TASK_COMM_LEN - 1] = '\0';
 	slot->arg0 = arg0;
 	slot->arg1 = arg1;
+	slot->ret = 0;
+	slot->has_ret = 0;
 	ss_sanitize_str(slot->detail, detail ? detail : "", SS_EVENT_DETAIL_LEN);
-	raw_spin_unlock_irqrestore(&g_ring_lock, flags);
 
+	if (track_exit && g_tp_sys_exit_active) {
+		unsigned int k;
+		pid_t cur_pid = current->pid;
+
+		for (k = 0; k < SS_INFLIGHT_CAP; k++) {
+			if (g_inflight[k].active && g_inflight[k].pid == cur_pid) {
+				g_inflight[k].syscall_nr = syscall_nr;
+				g_inflight[k].ring_seq = seq;
+				break;
+			}
+		}
+		if (k == SS_INFLIGHT_CAP) {
+			unsigned int empty_idx = SS_INFLIGHT_CAP;
+			unsigned int oldest_idx = 0;
+			u32 max_age = 0;
+
+			for (k = 0; k < SS_INFLIGHT_CAP; k++) {
+				if (!g_inflight[k].active) {
+					empty_idx = k;
+					break;
+				} else {
+					u32 age = (u32)(seq - g_inflight[k].ring_seq);
+
+					if (age >= max_age) {
+						max_age = age;
+						oldest_idx = k;
+					}
+				}
+			}
+			if (empty_idx < SS_INFLIGHT_CAP) {
+				g_inflight[empty_idx].active = true;
+				g_inflight[empty_idx].pid = cur_pid;
+				g_inflight[empty_idx].syscall_nr = syscall_nr;
+				g_inflight[empty_idx].ring_seq = seq;
+				atomic_inc(&g_inflight_cnt);
+			} else {
+				g_inflight[oldest_idx].pid = cur_pid;
+				g_inflight[oldest_idx].syscall_nr = syscall_nr;
+				g_inflight[oldest_idx].ring_seq = seq;
+			}
+		}
+	}
 	atomic64_inc(&g_ring_total_events);
+	raw_spin_unlock_irqrestore(&g_ring_lock, flags);
+}
+
+static void ss_push_event(enum ss_event_type type, unsigned long arg0,
+			  unsigned long arg1, const char *detail)
+{
+	ss_push_event_track(type, arg0, arg1, detail, false, -1L);
 }
 
 /* Safe one-shot symbol lookup using standard kprobes (registered + unregistered in init) */
@@ -346,35 +418,35 @@ static void ss_tp_sys_enter_cb(void *data, struct pt_regs *regs, long id)
 	if (compat) {
 		switch (id) {
 		case SS_IA32_NR_ptrace:
-			ss_push_event(SS_EVT_SYSCALL_PTRACE, args[0], args[1], "sys32_ptrace");
+			ss_push_event_track(SS_EVT_SYSCALL_PTRACE, args[0], args[1], "sys32_ptrace", true, id);
 			break;
 		case SS_IA32_NR_process_vm_writev:
-			ss_push_event(SS_EVT_SYSCALL_VM_WRITEV, args[0], args[2], "sys32_process_vm_writev");
+			ss_push_event_track(SS_EVT_SYSCALL_VM_WRITEV, args[0], args[2], "sys32_process_vm_writev", true, id);
 			break;
 		case SS_IA32_NR_process_vm_readv:
-			ss_push_event(SS_EVT_SYSCALL_VM_READV, args[0], args[2], "sys32_process_vm_readv");
+			ss_push_event_track(SS_EVT_SYSCALL_VM_READV, args[0], args[2], "sys32_process_vm_readv", true, id);
 			break;
 		case SS_IA32_NR_memfd_create:
-			ss_push_event(SS_EVT_SYSCALL_MEMFD, 0, args[1], "sys32_memfd_create");
+			ss_push_event_track(SS_EVT_SYSCALL_MEMFD, 0, args[1], "sys32_memfd_create", true, id);
 			break;
 		case SS_IA32_NR_execveat:
-			ss_push_event(SS_EVT_SYSCALL_EXECVEAT, args[0], args[4], "sys32_execveat");
+			ss_push_event_track(SS_EVT_SYSCALL_EXECVEAT, args[0], args[4], "sys32_execveat", true, id);
 			break;
 		case SS_IA32_NR_init_module:
 		case SS_IA32_NR_finit_module:
-			ss_push_event(SS_EVT_SYSCALL_MOD_LOAD, (unsigned long)id, args[0], "sys32_module_load");
+			ss_push_event_track(SS_EVT_SYSCALL_MOD_LOAD, (unsigned long)id, args[0], "sys32_module_load", true, id);
 			break;
 		case SS_IA32_NR_bpf:
-			ss_push_event(SS_EVT_SYSCALL_BPF, args[0], 0, "sys32_bpf");
+			ss_push_event_track(SS_EVT_SYSCALL_BPF, args[0], 0, "sys32_bpf", true, id);
 			break;
 		case SS_IA32_NR_iopl:
 		case SS_IA32_NR_ioperm:
-			ss_push_event(SS_EVT_SYSCALL_IOPL, (unsigned long)id, args[0], "sys32_rawio_port");
+			ss_push_event_track(SS_EVT_SYSCALL_IOPL, (unsigned long)id, args[0], "sys32_rawio_port", true, id);
 			break;
 		case SS_IA32_NR_ioctl:
 			if ((unsigned int)args[1] == (unsigned int)UI_DEV_CREATE)
-				ss_push_event(SS_EVT_SYSCALL_UINPUT_CREATE, args[0], args[1],
-					      "sys32_ioctl_ui_dev_create");
+				ss_push_event_track(SS_EVT_SYSCALL_UINPUT_CREATE, args[0], args[1],
+						    "sys32_ioctl_ui_dev_create", true, id);
 			break;
 		default:
 			break;
@@ -385,54 +457,107 @@ static void ss_tp_sys_enter_cb(void *data, struct pt_regs *regs, long id)
 	/* Fast path: immediately exit for 99.99% of routine 64-bit syscalls */
 	switch (id) {
 	case __NR_ptrace:
-		ss_push_event(SS_EVT_SYSCALL_PTRACE, args[0], args[1], "sys_ptrace");
+		ss_push_event_track(SS_EVT_SYSCALL_PTRACE, args[0], args[1], "sys_ptrace", true, id);
 		break;
 	case __NR_process_vm_writev:
-		ss_push_event(SS_EVT_SYSCALL_VM_WRITEV, args[0], args[2], "sys_process_vm_writev");
+		ss_push_event_track(SS_EVT_SYSCALL_VM_WRITEV, args[0], args[2], "sys_process_vm_writev", true, id);
 		break;
 	case __NR_process_vm_readv:
-		ss_push_event(SS_EVT_SYSCALL_VM_READV, args[0], args[2], "sys_process_vm_readv");
+		ss_push_event_track(SS_EVT_SYSCALL_VM_READV, args[0], args[2], "sys_process_vm_readv", true, id);
 		break;
 	case __NR_memfd_create:
-		ss_push_event(SS_EVT_SYSCALL_MEMFD, 0, args[1], "sys_memfd_create");
+		ss_push_event_track(SS_EVT_SYSCALL_MEMFD, 0, args[1], "sys_memfd_create", true, id);
 		break;
 	case __NR_execveat:
-		ss_push_event(SS_EVT_SYSCALL_EXECVEAT, args[0], args[4], "sys_execveat");
+		ss_push_event_track(SS_EVT_SYSCALL_EXECVEAT, args[0], args[4], "sys_execveat", true, id);
 		break;
 	case __NR_init_module:
 	case __NR_finit_module:
-		ss_push_event(SS_EVT_SYSCALL_MOD_LOAD, (unsigned long)id, args[0], "sys_module_load");
+		ss_push_event_track(SS_EVT_SYSCALL_MOD_LOAD, (unsigned long)id, args[0], "sys_module_load", true, id);
 		break;
 	case __NR_bpf:
-		ss_push_event(SS_EVT_SYSCALL_BPF, args[0], 0, "sys_bpf");
+		ss_push_event_track(SS_EVT_SYSCALL_BPF, args[0], 0, "sys_bpf", true, id);
 		break;
 	case __NR_iopl:
 	case __NR_ioperm:
-		ss_push_event(SS_EVT_SYSCALL_IOPL, (unsigned long)id, args[0], "sys_rawio_port");
+		ss_push_event_track(SS_EVT_SYSCALL_IOPL, (unsigned long)id, args[0], "sys_rawio_port", true, id);
 		break;
 	case __NR_ioctl:
 		if ((unsigned int)args[1] == (unsigned int)UI_DEV_CREATE)
-			ss_push_event(SS_EVT_SYSCALL_UINPUT_CREATE, args[0], args[1],
-				      "sys_ioctl_ui_dev_create");
+			ss_push_event_track(SS_EVT_SYSCALL_UINPUT_CREATE, args[0], args[1],
+					    "sys_ioctl_ui_dev_create", true, id);
 		break;
 	default:
 		break;
 	}
 }
 
+static void ss_tp_sys_exit_cb(void *data, struct pt_regs *regs, long ret)
+{
+	unsigned long flags;
+	unsigned int k;
+	pid_t cur_pid;
+	long nr;
+
+	(void)data;
+
+	if (atomic_read(&g_inflight_cnt) <= 0 || !g_event_ring || !regs)
+		return;
+
+	cur_pid = current->pid;
+	nr = syscall_get_nr(current, regs);
+
+	raw_spin_lock_irqsave(&g_ring_lock, flags);
+	for (k = 0; k < SS_INFLIGHT_CAP; k++) {
+		if (g_inflight[k].active && g_inflight[k].pid == cur_pid &&
+		    g_inflight[k].syscall_nr == nr) {
+			unsigned int seq = g_inflight[k].ring_seq;
+			unsigned int ridx = seq % SS_EVENT_RING_CAP;
+
+			if (g_ring_slot_seq[ridx] == seq && g_event_ring[ridx].pid == cur_pid) {
+				g_event_ring[ridx].ret = ret;
+				g_event_ring[ridx].has_ret = 1;
+			}
+			g_inflight[k].active = false;
+			atomic_dec(&g_inflight_cnt);
+			break;
+		}
+	}
+	raw_spin_unlock_irqrestore(&g_ring_lock, flags);
+}
+
 static void ss_tp_sched_exec_cb(void *data, struct task_struct *p,
 				pid_t old_pid, struct linux_binprm *bprm)
 {
-	(void)data;
-	(void)bprm;
+	const char *fname_ptr = NULL;
+	char fname_local[SS_EVENT_DETAIL_LEN];
+	bool interesting_path = false;
 
-	/* Record only suspicious tmp/shm/memfd executions to avoid noise */
-	if (strnstr(current->comm, "memfd", TASK_COMM_LEN) ||
+	(void)data;
+
+	memset(fname_local, 0, sizeof(fname_local));
+	if (bprm && copy_from_kernel_nofault(&fname_ptr, &bprm->filename, sizeof(fname_ptr)) == 0 &&
+	    fname_ptr != NULL) {
+		if (copy_from_kernel_nofault(fname_local, fname_ptr, sizeof(fname_local) - 1) == 0) {
+			if (strncmp(fname_local, "/tmp/", 5) == 0 ||
+			    strncmp(fname_local, "/dev/shm/", 9) == 0 ||
+			    strncmp(fname_local, "/var/tmp/", 9) == 0 ||
+			    strncmp(fname_local, "/memfd:", 7) == 0 ||
+			    strncmp(fname_local, "memfd:", 6) == 0)
+				interesting_path = true;
+		} else {
+			fname_local[0] = '\0';
+		}
+	}
+
+	if (interesting_path ||
+	    strnstr(current->comm, "memfd", TASK_COMM_LEN) ||
 	    strnstr(current->comm, "sh", TASK_COMM_LEN) ||
 	    strnstr(current->comm, "java", TASK_COMM_LEN) ||
 	    strnstr(current->comm, "python", TASK_COMM_LEN)) {
 		ss_push_event(SS_EVT_PROCESS_EXEC, (unsigned long)old_pid,
-			      (unsigned long)(p ? p->tgid : 0), current->comm);
+			      (unsigned long)(p ? p->tgid : 0),
+			      fname_local[0] ? fname_local : current->comm);
 	}
 }
 
@@ -506,6 +631,7 @@ struct ss_tp_audit_ctx {
 	unsigned int count;
 	unsigned int max_items;
 	struct tracepoint *found_sys_enter;
+	struct tracepoint *found_sys_exit;
 	struct tracepoint *found_sched_exec;
 };
 
@@ -519,6 +645,8 @@ static void ss_visit_kernel_tp(struct tracepoint *tp, void *priv)
 		return;
 	if (!actx->found_sys_enter && strcmp(tp->name, "sys_enter") == 0)
 		actx->found_sys_enter = tp;
+	if (!actx->found_sys_exit && strcmp(tp->name, "sys_exit") == 0)
+		actx->found_sys_exit = tp;
 	if (!actx->found_sched_exec && strcmp(tp->name, "sched_process_exec") == 0)
 		actx->found_sched_exec = tp;
 
@@ -574,20 +702,45 @@ static const char *ss_classify_prologue(const u8 *code, size_t len, unsigned lon
 		*out_target = fn_addr + off + 6 + (long)disp;
 		return "JMP_IND_RIP_HOOK";
 	}
-	/* mov rax/r11, imm64; jmp reg (48/49 B8/BB <8bytes> [41] FF E0/E3) */
+	/*
+	 * Verify actual mov reg, imm64 + indirect jmp/call/push-ret on the SAME register
+	 * AND canonical kernel-half address before classifying as a trampoline.
+	 */
 	if ((code[off] == 0x48 || code[off] == 0x49) &&
 	    (code[off + 1] >= 0xb8 && code[off + 1] <= 0xbf) &&
-	    off + 12 <= len) {
+	    off + 10 <= len) {
+		u8 rex_b = code[off] & 0x01;
+		u8 reg = (u8)(code[off + 1] - 0xb8);
+		size_t tail = off + 10;
+		bool is_branch = false;
+
 		memcpy(&imm64, code + off + 2, 8);
-		*out_target = (unsigned long)imm64;
-		return "MOV_IMM64_TRAMPOLINE";
+		if (!rex_b && tail + 2 <= len) {
+			if ((code[tail] == 0xff && (code[tail + 1] == (u8)(0xe0 + reg) ||
+						    code[tail + 1] == (u8)(0xd0 + reg))) ||
+			    (code[tail] == (u8)(0x50 + reg) && code[tail + 1] == 0xc3))
+				is_branch = true;
+		} else if (rex_b && tail + 3 <= len && code[tail] == 0x41) {
+			if ((code[tail + 1] == 0xff && (code[tail + 2] == (u8)(0xe0 + reg) ||
+							code[tail + 2] == (u8)(0xd0 + reg))) ||
+			    (code[tail + 1] == (u8)(0x50 + reg) && code[tail + 2] == 0xc3))
+				is_branch = true;
+		}
+		if (is_branch && imm64 >= 0xffff800000000000ULL) {
+			*out_target = (unsigned long)imm64;
+			return "MOV_IMM64_TRAMPOLINE";
+		}
+		return "MOV_IMM64_DATA";
 	}
 	if (code[off] == 0xe8 && off + 5 <= len) {
 		memcpy(&disp, code + off + 1, 4);
 		*out_target = fn_addr + off + 5 + (long)disp;
 		return "CALL_REL32";
 	}
-	if (code[off] == 0x0f && code[off + 1] == 0x1f && code[off + 2] == 0x44)
+	if ((off + 3 <= len && code[off] == 0x0f && code[off + 1] == 0x1f &&
+	     (code[off + 2] == 0x44 || code[off + 2] == 0x40 || code[off + 2] == 0x80 ||
+	      code[off + 2] == 0x84 || code[off + 2] == 0x00)) ||
+	    (off + 4 <= len && code[off] == 0x66 && code[off + 1] == 0x0f && code[off + 2] == 0x1f))
 		return "CANONICAL_FENTRY_NOP";
 	return "STANDARD";
 }
@@ -627,14 +780,19 @@ static inline bool ss_is_vmalloc_or_module_addr(const void *x)
 	return is_vmalloc_addr(x);
 }
 
-static unsigned int ss_snapshot_modules(struct ss_mod_snap *out, unsigned int max_cnt)
+static unsigned int ss_snapshot_modules(struct ss_mod_snap *out,
+					  unsigned int max_cnt,
+					  bool *truncated_out)
 {
 	struct module *mod;
 	unsigned int cnt = 0;
+	unsigned int steps = 0;
 	unsigned int i;
 	struct list_head *head = &THIS_MODULE->list;
 	struct list_head *cur;
 
+	if (truncated_out)
+		*truncated_out = false;
 	if (!out || max_cnt == 0)
 		return 0;
 
@@ -656,7 +814,7 @@ static unsigned int ss_snapshot_modules(struct ss_mod_snap *out, unsigned int ma
 
 	rcu_read_lock();
 	cur = rcu_dereference(head->next);
-	while (cur && cur != head && cnt < max_cnt) {
+	while (cur && cur != head && cnt < max_cnt && steps < max_cnt * 4U) {
 		unsigned long next_ptr = 0;
 		char name_tmp[MODULE_NAME_LEN];
 		enum module_state st = MODULE_STATE_UNFORMED;
@@ -665,6 +823,7 @@ static unsigned int ss_snapshot_modules(struct ss_mod_snap *out, unsigned int ma
 		unsigned int text_sz = 0, init_sz = 0;
 		bool sig_val = false;
 
+		steps++;
 		mod = list_entry(cur, struct module, list);
 		/* Real struct module nodes live in vmalloc/module space, unlike the &modules core sentinel */
 		if (ss_is_vmalloc_or_module_addr((const void *)cur)) {
@@ -719,6 +878,8 @@ static unsigned int ss_snapshot_modules(struct ss_mod_snap *out, unsigned int ma
 			break;
 		cur = (struct list_head *)next_ptr;
 	}
+	if (truncated_out && cur && cur != head && (cnt >= max_cnt || steps >= max_cnt * 4U))
+		*truncated_out = true;
 	rcu_read_unlock();
 
 	for (i = 0; i < cnt; i++) {
@@ -803,12 +964,13 @@ static int ss_status_show(struct seq_file *m, void *v)
 
 	seq_printf(m,
 		   "STATUS|version=%s|kernel=%s|nonce=%s|taint_str=%s|"
-		   "live_probes=%d|tp_sys_enter=%d|tp_exec=%d|kp_input=%d|"
+		   "live_probes=%d|tp_sys_enter=%d|tp_sys_exit=%d|tp_exec=%d|kp_input=%d|"
 		   "mod_notifier=%d|events_total=%lld|active_readers=%d|"
 		   "self_text_start=0x%px|self_text_end=0x%px\n",
 		   SS_KMOD_VERSION, utsname()->release, nonce_safe, taint_buf,
 		   enable_live_probes ? 1 : 0,
 		   g_tp_sys_enter_active ? 1 : 0,
+		   g_tp_sys_exit_active ? 1 : 0,
 		   g_tp_sched_exec_active ? 1 : 0,
 		   g_kp_input_active ? 1 : 0,
 		   g_mod_notifier_active ? 1 : 0,
@@ -936,12 +1098,15 @@ static void ss_scan_modules_vaddr_exec(struct seq_file *m,
 	/* Step across MODULES_VADDR..MODULES_END at page resolution */
 	for (addr = MODULES_VADDR; addr < MODULES_END && emitted < 256; ) {
 		unsigned int level = PG_LEVEL_NONE;
-		pte_t *ptep = lookup_address(addr, &level);
+		pte_t *ptep;
 		unsigned long step = PAGE_SIZE;
 		bool present_exec = false;
 		bool rw = false;
 		const struct ss_mod_snap *cur_owner = NULL;
 
+		if (seq_has_overflowed(m))
+			break;
+		ptep = lookup_address(addr, &level);
 		if ((++iter & 1023U) == 0)
 			cond_resched();
 
@@ -969,7 +1134,7 @@ static void ss_scan_modules_vaddr_exec(struct seq_file *m,
 			emitted++;
 			in_region = false;
 			reg_owner = NULL;
-			if (emitted >= 256)
+			if (emitted >= 256 || seq_has_overflowed(m))
 				break;
 		}
 
@@ -992,7 +1157,7 @@ static void ss_scan_modules_vaddr_exec(struct seq_file *m,
 		addr += step;
 	}
 
-	if (in_region && emitted < 256)
+	if (in_region && emitted < 256 && !seq_has_overflowed(m))
 		ss_emit_modxscan_region(m, reg_start, reg_end, reg_rw, reg_owner, sample);
 
 	kfree(sample);
@@ -1033,6 +1198,8 @@ static int ss_integrity_show(struct seq_file *m, void *v)
 		unsigned long jmp_target = 0;
 		const char *hook_cls = "UNRESOLVED";
 
+		if (seq_has_overflowed(m))
+			break;
 		if (!addr) {
 			seq_printf(m, "KHOOK|sym=%s|addr=0x0|hook_class=UNRESOLVED\n",
 				   g_integrity_targets[i].name);
@@ -1063,42 +1230,60 @@ static int ss_integrity_show(struct seq_file *m, void *v)
 	}
 
 	/* 2. Live VFS directory iterator hooks (/proc and /) */
-	ss_audit_vfs_mount(m, "/proc");
-	ss_audit_vfs_mount(m, "/");
+	if (!seq_has_overflowed(m)) {
+		ss_audit_vfs_mount(m, "/proc");
+		ss_audit_vfs_mount(m, "/");
+	}
 
 	/* 3. Active tracepoint callbacks across whole kernel */
-	tp_ctx.items = kvcalloc(SS_MAX_TP_CB, sizeof(*tp_ctx.items), GFP_KERNEL);
-	tp_ctx.count = 0;
-	tp_ctx.max_items = SS_MAX_TP_CB;
-	tp_ctx.found_sys_enter = NULL;
-	tp_ctx.found_sched_exec = NULL;
-	for_each_kernel_tracepoint(ss_visit_kernel_tp, &tp_ctx);
-	for (i = 0; i < tp_ctx.count; i++) {
-		bool is_self = (tp_ctx.items[i].func_addr == (unsigned long)ss_tp_sys_enter_cb ||
-				tp_ctx.items[i].func_addr == (unsigned long)ss_tp_sched_exec_cb);
-		sprint_symbol(sym_buf, tp_ctx.items[i].func_addr);
-		seq_printf(m, "TPCALLBACK|tp=%s|idx=%d|prio=%d|func=0x%lx|sym=%s|is_self=%d\n",
-			   tp_ctx.items[i].tp_name, tp_ctx.items[i].idx,
-			   tp_ctx.items[i].prio, tp_ctx.items[i].func_addr,
-			   sym_buf, is_self ? 1 : 0);
+	if (!seq_has_overflowed(m)) {
+		memset(&tp_ctx, 0, sizeof(tp_ctx));
+		tp_ctx.items = kvcalloc(SS_MAX_TP_CB, sizeof(*tp_ctx.items), GFP_KERNEL);
+		tp_ctx.max_items = SS_MAX_TP_CB;
+		if (tp_ctx.items) {
+			for_each_kernel_tracepoint(ss_visit_kernel_tp, &tp_ctx);
+			for (i = 0; i < tp_ctx.count; i++) {
+				bool is_self;
+
+				if (seq_has_overflowed(m))
+					break;
+				is_self = (tp_ctx.items[i].func_addr == (unsigned long)ss_tp_sys_enter_cb ||
+					   tp_ctx.items[i].func_addr == (unsigned long)ss_tp_sys_exit_cb ||
+					   tp_ctx.items[i].func_addr == (unsigned long)ss_tp_sched_exec_cb);
+				sprint_symbol(sym_buf, tp_ctx.items[i].func_addr);
+				seq_printf(m, "TPCALLBACK|tp=%s|idx=%d|prio=%d|func=0x%lx|sym=%s|is_self=%d\n",
+					   tp_ctx.items[i].tp_name, tp_ctx.items[i].idx,
+					   tp_ctx.items[i].prio, tp_ctx.items[i].func_addr,
+					   sym_buf, is_self ? 1 : 0);
+			}
+			kvfree(tp_ctx.items);
+		}
 	}
-	kvfree(tp_ctx.items);
 
 	/* 4. Loaded LKM snapshot + MODULES_VADDR executable CR3 scan + orphan ELF carving */
-	mods = kvcalloc(SS_MAX_MOD_SNAP, sizeof(*mods), GFP_KERNEL);
-	if (mods) {
-		mod_cnt = ss_snapshot_modules(mods, SS_MAX_MOD_SNAP);
-		for (i = 0; i < mod_cnt; i++) {
-			seq_printf(m,
-				   "MODINFO|name=%s|state=%d|taints=0x%lx|sig_ok=%d|text=0x%lx-0x%lx|init=0x%lx-0x%lx|rw_anom=%d\n",
-				   mods[i].name, mods[i].state, mods[i].taints,
-				   mods[i].sig_ok ? 1 : 0,
-				   mods[i].text_start, mods[i].text_end,
-				   mods[i].init_start, mods[i].init_end,
-				   mods[i].text_rw_anomaly ? 1 : 0);
+	if (!seq_has_overflowed(m)) {
+		bool mods_truncated = false;
+
+		mods = kvcalloc(SS_MAX_MOD_SNAP, sizeof(*mods), GFP_KERNEL);
+		if (mods) {
+			mod_cnt = ss_snapshot_modules(mods, SS_MAX_MOD_SNAP, &mods_truncated);
+			if (mods_truncated && !seq_has_overflowed(m))
+				seq_printf(m, "TRUNCATED|mods=1|max_mods=%u\n", SS_MAX_MOD_SNAP);
+			for (i = 0; i < mod_cnt; i++) {
+				if (seq_has_overflowed(m))
+					break;
+				seq_printf(m,
+					   "MODINFO|name=%s|state=%d|taints=0x%lx|sig_ok=%d|text=0x%lx-0x%lx|init=0x%lx-0x%lx|rw_anom=%d\n",
+					   mods[i].name, mods[i].state, mods[i].taints,
+					   mods[i].sig_ok ? 1 : 0,
+					   mods[i].text_start, mods[i].text_end,
+					   mods[i].init_start, mods[i].init_end,
+					   mods[i].text_rw_anomaly ? 1 : 0);
+			}
+			if (!seq_has_overflowed(m))
+				ss_scan_modules_vaddr_exec(m, mods, mod_cnt);
+			kvfree(mods);
 		}
-		ss_scan_modules_vaddr_exec(m, mods, mod_cnt);
-		kvfree(mods);
 	}
 	kfree(sym_alloc);
 	return 0;
@@ -1114,6 +1299,7 @@ struct ss_task_snap {
 	pid_t real_ppid;
 	uid_t uid;
 	unsigned int ptrace;
+	u64 start_ns;
 	char comm[TASK_COMM_LEN];
 };
 
@@ -1221,6 +1407,7 @@ static int ss_tasks_vma_show(struct seq_file *m, void *v)
 		snaps[task_cnt].real_ppid = rp ? rp->tgid : 0;
 		snaps[task_cnt].uid = from_kuid_munged(&init_user_ns, task_uid(p));
 		snaps[task_cnt].ptrace = p->ptrace;
+		snaps[task_cnt].start_ns = p->start_boottime;
 		ss_sanitize_str(snaps[task_cnt].comm, p->comm, TASK_COMM_LEN);
 		task_cnt++;
 	}
@@ -1232,7 +1419,7 @@ static int ss_tasks_vma_show(struct seq_file *m, void *v)
 	/* Phase 2: Safe per-task mm + VMA + out-of-lock access_process_vm inspection */
 	for (i = 0; i < task_cnt; i++) {
 		struct task_struct *t = snaps[i].task;
-		struct mm_struct *mm = get_task_mm(t);
+		struct mm_struct *mm;
 		char exe_safe[256];
 		bool deleted_exe = false;
 		bool deep_target;
@@ -1241,6 +1428,11 @@ static int ss_tasks_vma_show(struct seq_file *m, void *v)
 		bool cands_truncated = false;
 		unsigned int total_vmas = 0, exec_vmas = 0, rwx_vmas = 0, anon_exec = 0;
 
+		if (seq_has_overflowed(m)) {
+			put_task_struct(t);
+			continue;
+		}
+		mm = get_task_mm(t);
 		strscpy(exe_safe, "NONE", sizeof(exe_safe));
 		if (mm) {
 			struct file *exe_f;
@@ -1269,15 +1461,17 @@ static int ss_tasks_vma_show(struct seq_file *m, void *v)
 		}
 
 		seq_printf(m,
-			   "TASK|pid=%d|tgid=%d|ppid=%d|real_ppid=%d|uid=%u|ptrace=0x%x|comm=%s|exe=%s|deleted=%d\n",
+			   "TASK|pid=%d|tgid=%d|ppid=%d|real_ppid=%d|uid=%u|ptrace=0x%x|start_ns=%llu|comm=%s|exe=%s|deleted=%d\n",
 			   snaps[i].pid, snaps[i].tgid, snaps[i].ppid,
 			   snaps[i].real_ppid, snaps[i].uid, snaps[i].ptrace,
+			   (unsigned long long)snaps[i].start_ns,
 			   snaps[i].comm, exe_safe, deleted_exe ? 1 : 0);
 
-		deep_target = mm && (ss_is_interesting_comm(snaps[i].comm) ||
-				     ss_is_interesting_path(exe_safe) ||
-				     snaps[i].ptrace != 0 || deleted_exe ||
-				     ss_pid_in_event_ring(snaps[i].tgid));
+		deep_target = mm && !seq_has_overflowed(m) &&
+			      (ss_is_interesting_comm(snaps[i].comm) ||
+			       ss_is_interesting_path(exe_safe) ||
+			       snaps[i].ptrace != 0 || deleted_exe ||
+			       ss_pid_in_event_ring(snaps[i].tgid));
 
 		if (deep_target) {
 			struct vm_area_struct *vma;
@@ -1368,14 +1562,20 @@ static int ss_tasks_vma_show(struct seq_file *m, void *v)
 				   rwx_vmas, anon_exec, cand_cnt, cands_truncated ? 1 : 0);
 
 			for (j = 0; j < cand_cnt; j++) {
-				unsigned long sz = cands[j].vm_end - cands[j].vm_start;
-				int to_read = (int)min_t(unsigned long, sz, effective_scan_cap);
+				unsigned long sz;
+				int to_read;
 				int got = 0;
 				bool elf_hit = false, pe_hit = false;
-				bool ro_only = !(cands[j].vm_flags & VM_EXEC) &&
-					       !cands[j].is_rwx && !cands[j].is_anon_exec;
+				bool ro_only;
 				unsigned int jni_mask = 0, jni_hits = 0;
 				u8 head[SS_VMA_HEAD_BYTES];
+
+				if (seq_has_overflowed(m))
+					break;
+				sz = cands[j].vm_end - cands[j].vm_start;
+				to_read = (int)min_t(unsigned long, sz, effective_scan_cap);
+				ro_only = !(cands[j].vm_flags & VM_EXEC) &&
+					  !cands[j].is_rwx && !cands[j].is_anon_exec;
 
 				memset(head, 0, sizeof(head));
 				if (to_read > 0) {
@@ -1473,7 +1673,7 @@ static bool ss_check_pci_cap_loop(struct pci_dev *pdev)
 	if (pci_read_config_byte(pdev, PCI_CAPABILITY_LIST, &pos) != 0)
 		return false;
 	pos &= 0xfc;
-	while (pos >= 0x40 && hops < 48) {
+	while (pos >= 0x40 && (int)pos + 1 < pdev->cfg_size && hops < 48) {
 		unsigned int slot = pos >> 2;
 
 		if (visited & (1ULL << slot))
@@ -1511,6 +1711,9 @@ static int ss_pci_visit_dev(struct device *dev, void *data)
 	char drv_name[64];
 	int off;
 
+	if (seq_has_overflowed(m))
+		return 1;
+
 	dom = iommu_get_domain_for_dev(dev);
 	grp = iommu_group_get(dev);
 	if (grp) {
@@ -1524,6 +1727,8 @@ static int ss_pci_visit_dev(struct device *dev, void *data)
 		 (vid_chk == 0xffff);
 
 	if (!d3cold) {
+		int cfg_lim = min_t(int, 64, max_t(int, 0, pdev->cfg_size));
+
 		if (pci_read_config_word(pdev, PCI_COMMAND, &cmd) == 0)
 			bme_hw = (cmd & PCI_COMMAND_MASTER) != 0;
 
@@ -1537,11 +1742,13 @@ static int ss_pci_visit_dev(struct device *dev, void *data)
 			pci_read_config_dword(pdev, dsn_pos + 8, &dsn_hi);
 		}
 
-		pci_read_config_dword(pdev, PCI_BASE_ADDRESS_0, &bar0);
-		pci_read_config_dword(pdev, PCI_BASE_ADDRESS_1, &bar1);
+		if (cfg_lim >= 0x14)
+			pci_read_config_dword(pdev, PCI_BASE_ADDRESS_0, &bar0);
+		if (cfg_lim >= 0x18)
+			pci_read_config_dword(pdev, PCI_BASE_ADDRESS_1, &bar1);
 		cap_loop = ss_check_pci_cap_loop(pdev);
 
-		for (off = 0; off < 64; off += 4) {
+		for (off = 0; off + 4 <= cfg_lim; off += 4) {
 			u32 val = 0;
 
 			if (pci_read_config_dword(pdev, off, &val) == 0)
@@ -1596,7 +1803,8 @@ static int ss_pci_iommu_show(struct seq_file *m, void *v)
 static int ss_events_show(struct seq_file *m, void *v)
 {
 	struct ss_kprobe_event *copy;
-	unsigned int total_written, count, start_idx, i;
+	u64 total_events = 0, dropped = 0;
+	unsigned int count, start_idx, i;
 	unsigned long flags;
 
 	if (!g_event_ring)
@@ -1607,20 +1815,29 @@ static int ss_events_show(struct seq_file *m, void *v)
 		return -ENOMEM;
 
 	raw_spin_lock_irqsave(&g_ring_lock, flags);
-	total_written = g_ring_write_idx;
-	count = min_t(unsigned int, total_written, SS_EVENT_RING_CAP);
-	start_idx = (total_written >= SS_EVENT_RING_CAP) ?
-		    (total_written - SS_EVENT_RING_CAP) : 0;
+	total_events = (u64)atomic64_read(&g_ring_total_events);
+	count = (unsigned int)min_t(u64, total_events, (u64)SS_EVENT_RING_CAP);
+	dropped = (total_events > SS_EVENT_RING_CAP) ? (total_events - SS_EVENT_RING_CAP) : 0ULL;
+	start_idx = (total_events >= SS_EVENT_RING_CAP) ?
+		    (unsigned int)((total_events - SS_EVENT_RING_CAP) % SS_EVENT_RING_CAP) : 0U;
 	for (i = 0; i < count; i++)
 		copy[i] = g_event_ring[(start_idx + i) % SS_EVENT_RING_CAP];
 	raw_spin_unlock_irqrestore(&g_ring_lock, flags);
 
+	seq_printf(m, "EVENT_META|cap=%u|total=%llu|dropped=%llu\n",
+		   SS_EVENT_RING_CAP,
+		   (unsigned long long)total_events,
+		   (unsigned long long)dropped);
+
 	for (i = 0; i < count; i++) {
+		if (seq_has_overflowed(m))
+			break;
 		seq_printf(m,
-			   "EVENT|ts_ns=%llu|type=%u|pid=%d|tgid=%d|uid=%u|comm=%s|arg0=0x%lx|arg1=0x%lx|detail=%s\n",
+			   "EVENT|ts_ns=%llu|type=%u|pid=%d|tgid=%d|uid=%u|comm=%s|arg0=0x%lx|arg1=0x%lx|ret=%ld|has_ret=%u|start_ns=%llu|detail=%s\n",
 			   copy[i].ts_ns, copy[i].type, copy[i].pid, copy[i].tgid,
 			   copy[i].uid, copy[i].comm, copy[i].arg0, copy[i].arg1,
-			   copy[i].detail);
+			   copy[i].ret, (unsigned int)copy[i].has_ret,
+			   copy[i].start_ns, copy[i].detail);
 	}
 	kvfree(copy);
 	return 0;
@@ -1681,6 +1898,10 @@ static void ss_teardown_probes(void)
 		tracepoint_probe_unregister(g_tp_sys_enter, ss_tp_sys_enter_cb, NULL);
 		g_tp_sys_enter_active = false;
 	}
+	if (g_tp_sys_exit_active && g_tp_sys_exit) {
+		tracepoint_probe_unregister(g_tp_sys_exit, ss_tp_sys_exit_cb, NULL);
+		g_tp_sys_exit_active = false;
+	}
 	if (g_tp_sched_exec_active && g_tp_sched_exec) {
 		tracepoint_probe_unregister(g_tp_sched_exec, ss_tp_sched_exec_cb, NULL);
 		g_tp_sched_exec_active = false;
@@ -1735,7 +1956,12 @@ static int __init mc_ss_init(void)
 		memset(&tp_ctx, 0, sizeof(tp_ctx));
 		for_each_kernel_tracepoint(ss_visit_kernel_tp, &tp_ctx);
 		g_tp_sys_enter = tp_ctx.found_sys_enter;
+		g_tp_sys_exit = tp_ctx.found_sys_exit;
 		g_tp_sched_exec = tp_ctx.found_sched_exec;
+
+		if (g_tp_sys_exit &&
+		    tracepoint_probe_register(g_tp_sys_exit, ss_tp_sys_exit_cb, NULL) == 0)
+			g_tp_sys_exit_active = true;
 
 		if (g_tp_sys_enter &&
 		    tracepoint_probe_register(g_tp_sys_enter, ss_tp_sys_enter_cb, NULL) == 0)
@@ -1752,9 +1978,10 @@ static int __init mc_ss_init(void)
 			g_mod_notifier_active = true;
 	}
 
-	pr_info("sentinel armed (live_probes=%d tp_sys=%d tp_exec=%d kp_input=%d)\n",
+	pr_info("sentinel armed (live_probes=%d tp_sys=%d tp_sys_exit=%d tp_exec=%d kp_input=%d)\n",
 		enable_live_probes ? 1 : 0,
 		g_tp_sys_enter_active ? 1 : 0,
+		g_tp_sys_exit_active ? 1 : 0,
 		g_tp_sched_exec_active ? 1 : 0,
 		g_kp_input_active ? 1 : 0);
 	return 0;

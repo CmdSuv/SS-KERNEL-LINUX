@@ -18,7 +18,12 @@ from . import (
     engine8_reporter,
     engine9_kernel,
 )
-from .models import ScanContext
+from .models import ScanContext, ScanStatus
+
+
+class ScanCancelledError(Exception):
+    """Raised cooperatively when a scan is cancelled by the user."""
+
 
 ENGINES: tuple[tuple[str, Callable[[ScanContext], None]], ...] = (
     ("E1", engine1_integrity.run),
@@ -76,13 +81,15 @@ def run_all_engines(
     progress_pct_cb: Callable[[int, str], None] | None = None,
 ) -> dict[str, float]:
     ctx.telemetry["tool_self_sha256_prefix"] = compute_tool_self_hash()
+    ctx.telemetry["scan_cancelled"] = False
     timings: dict[str, float] = {}
 
-    active: list[tuple[str, Callable[[ScanContext], None]]] = [
-        (code, fn)
-        for code, fn in ENGINES
-        if selected_engines is None or code in selected_engines
-    ]
+    active: list[tuple[str, Callable[[ScanContext], None]]] = []
+    for code, fn in ENGINES:
+        if selected_engines is None or code in selected_engines:
+            active.append((code, fn))
+        else:
+            ctx.set_engine_status(code, ScanStatus.SKIPPED, "Secili motor filtresi disinda birakildi")
     active.append(("E8", engine8_reporter.correlate_findings))
 
     total_weight = max(1, sum(ENGINE_WEIGHTS.get(c, 5) for c, _ in active))
@@ -99,6 +106,11 @@ def run_all_engines(
     acc_weight = 0.0
 
     for code, fn in active:
+        if ctx.is_cancelled():
+            ctx.set_engine_status(code, ScanStatus.CANCELLED, "Kullanici tarafindan iptal edildi")
+            ctx.telemetry["scan_cancelled"] = True
+            raise ScanCancelledError("Tarama kullanici tarafindan iptal edildi.")
+
         w = ENGINE_WEIGHTS.get(code, 5)
         start_pct = (acc_weight / total_weight) * 100.0
         end_pct = ((acc_weight + w) / total_weight) * 100.0
@@ -113,17 +125,38 @@ def run_all_engines(
         _emit_pct(int(start_pct), f"{code}: {desc}...")
 
         def _sub_cb(frac: float, detail: str, _s: float = start_pct, _e: float = end_pct, _c: str = code) -> None:
+            if ctx.is_cancelled():
+                raise ScanCancelledError("Tarama kullanici tarafindan iptal edildi.")
             raw = _s + max(0.0, min(1.0, frac)) * (_e - _s)
             cap = 100 if _c == "E8" else min(99, int(round(_e)))
             _emit_pct(min(cap, int(raw)), f"{_c}: {detail}")
 
-        setattr(ctx, "_engine_progress_cb", _sub_cb)
+        err_before = len(ctx.errors)
+        ctx._engine_progress_cb = _sub_cb
         t0 = time.monotonic()
         try:
             fn(ctx)
+        except ScanCancelledError:
+            ctx.set_engine_status(code, ScanStatus.CANCELLED, "Kullanici tarafindan iptal edildi")
+            ctx.telemetry["scan_cancelled"] = True
+            raise
+        except Exception as exc:
+            ctx.add_error(code, f"Motor calisma hatasi: {exc}")
+            ctx.set_engine_status(code, ScanStatus.ERROR, str(exc))
+        else:
+            existing_status = (ctx.telemetry.get("engine_status") or {}).get(code)
+            existing_state = str(existing_status.get("status", "")).upper() if isinstance(existing_status, dict) else ""
+            if len(ctx.errors) > err_before:
+                if existing_status is None or existing_state == "COMPLETED":
+                    ctx.set_engine_status(
+                        code,
+                        ScanStatus.PARTIAL,
+                        f"{len(ctx.errors) - err_before} hata ile tamamlandi",
+                    )
+            elif existing_status is None:
+                ctx.set_engine_status(code, ScanStatus.COMPLETED, "Tamamlandi")
         finally:
-            if hasattr(ctx, "_engine_progress_cb"):
-                delattr(ctx, "_engine_progress_cb")
+            ctx._engine_progress_cb = None
         timings[code] = round(time.monotonic() - t0, 3)
 
         acc_weight += w

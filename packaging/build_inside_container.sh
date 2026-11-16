@@ -11,13 +11,17 @@ echo "[build] Target OS: ${TARGET_ID}"
 rm -rf "${WORK_DIR}" "${PYI_WORK}"
 mkdir -p "${WORK_DIR}" "${OUT_DIR}" "${PYI_WORK}"
 
-# Copy project cleanly excluding build artifacts & target outputs
+# Copy project cleanly excluding VCS/build artifacts & target outputs
 tar -C "${SRC_DIR}" \
+    --exclude="./.git" \
+    --exclude="./reports" \
     --exclude="./dist" \
     --exclude="./build" \
     --exclude="./targets" \
+    --exclude="./.pytest_cache" \
     --exclude="./__pycache__" \
     --exclude="*/__pycache__" \
+    --exclude="*.pyc" \
     --exclude="*.ko" \
     --exclude="*.mod" \
     --exclude="*.mod.c" \
@@ -72,8 +76,15 @@ hashes = sorted(
     for p in py_files
     if p.name != "_self_manifest.py"
 )
+probe_sha = (root / "native" / "ss_kernel_probe.sha256").read_text(encoding="utf-8").strip().split()[0].lower()
+ksrc_hashes: dict[str, str] = {}
+for fn in ("mc_ss_kmod.c", "mc_ss_kmod.h", "Makefile"):
+    kp = root / "kernel" / fn
+    if kp.is_file():
+        ksrc_hashes[fn] = hashlib.sha256(kp.read_bytes()).hexdigest()
+
 lines = [
-    '"""SHA-256 manifest of verified MC SS Sentinel Python source files (populated at binary build time)."""',
+    '"""SHA-256 manifest of verified MC SS Sentinel Python, C probe, and kernel source files (populated at build time)."""',
     "",
     "from __future__ import annotations",
     "",
@@ -82,6 +93,12 @@ lines = [
 for h in hashes:
     lines.append(f'    "{h}",')
 lines.append("})")
+lines.append("")
+lines.append(f'NATIVE_PROBE_SHA256: str = "{probe_sha}"')
+lines.append("KERNEL_SOURCES_SHA256: dict[str, str] = {")
+for k in sorted(ksrc_hashes.keys()):
+    lines.append(f'    "{k}": "{ksrc_hashes[k]}",')
+lines.append("}")
 (root / "ss_core" / "_self_manifest.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
 PYEOF
 

@@ -8,7 +8,7 @@ import re
 import stat
 from pathlib import Path
 
-from .models import Confidence, Finding, ScanContext, Severity
+from .models import Confidence, Finding, ScanContext, ScanStatus, Severity
 from .signatures import HARDWARE_CONFIG_APPS
 from .utils import (
     emit_scan_progress,
@@ -499,6 +499,10 @@ def run(ctx: ScanContext) -> None:
         emit_scan_progress(ctx, 0.92, "Ratbag ve sistem girdi servisleri kontrol ediliyor...")
         _check_live_services_and_ratbag(ctx)
         record_scan_region(ctx, "E3", "ratbagctl / Piper, udev ve kullanici makro scriptleri")
+        ctx.set_coverage("E3.input", ScanStatus.COMPLETED, "Input devices & macro configs inspected")
         emit_scan_progress(ctx, 1.0, "Girdi ve makro analizi tamamlandi.")
     except Exception as exc:
+        if exc.__class__.__name__ == "ScanCancelledError":
+            raise
+        ctx.set_coverage("E3.input", ScanStatus.ERROR, str(exc))
         ctx.add_error(ENGINE_NAME, f"Beklenmeyen hata: {exc}")

@@ -18,7 +18,7 @@ import zlib
 from pathlib import Path
 from typing import Any
 
-from .models import Confidence, Finding, ScanContext, Severity
+from .models import Confidence, Finding, ScanContext, ScanStatus, Severity
 from .signatures import (
     ANTI_FORENSIC_CMD_RE,
     CHEAT_DOMAINS,
@@ -39,6 +39,7 @@ from .utils import (
     read_xattrs,
     record_scan_region,
     safe_read_bytes,
+    safe_zip_read,
     sha256_file,
     shannon_entropy,
     statx_timestamps,
@@ -1142,7 +1143,7 @@ def _analyze_jar_zip(
         # 5a. Manifest
         if "meta-inf/manifest.mf" in names_lower:
             try:
-                mf_raw = zf.read(names_lower["meta-inf/manifest.mf"])[:65536]
+                mf_raw = safe_zip_read(zf, zf.getinfo(names_lower["meta-inf/manifest.mf"]), 65536)
                 mf_txt = mf_raw.decode("utf-8", errors="replace")
                 raw_agents: list[str] = []
                 agent_entry_classes: list[str] = []
@@ -1158,14 +1159,16 @@ def _analyze_jar_zip(
                     and all(ac.startswith(_BENIGN_MANIFEST_AGENTS) for ac in agent_entry_classes)
                 ):
                     manifest_agents.extend(raw_agents)
-            except Exception:
+            except (OSError, ValueError, zipfile.BadZipFile, KeyError, zlib.error):
                 pass
 
         # 5b. Mod Metadata (Fabric/Quilt/Forge/NeoForge)
         for meta_name in ("fabric.mod.json", "quilt.mod.json", "mcmod.info"):
             if meta_name in names_lower:
                 try:
-                    raw = zf.read(names_lower[meta_name])[:262144].decode("utf-8", errors="replace")
+                    raw = safe_zip_read(zf, zf.getinfo(names_lower[meta_name]), 262144).decode(
+                        "utf-8", errors="replace"
+                    )
                     obj = json.loads(raw)
                     if isinstance(obj, dict):
                         if "id" in obj:
@@ -1186,18 +1189,20 @@ def _analyze_jar_zip(
                             mod_ids.append(str(obj[0]["modid"]))
                         if "name" in obj[0]:
                             mod_names.append(str(obj[0]["name"]))
-                except Exception:
+                except (OSError, ValueError, zipfile.BadZipFile, KeyError, zlib.error, json.JSONDecodeError):
                     pass
 
         for toml_name in ("meta-inf/mods.toml", "meta-inf/neoforge.mods.toml"):
             if toml_name in names_lower:
                 try:
-                    raw = zf.read(names_lower[toml_name])[:262144].decode("utf-8", errors="replace")
+                    raw = safe_zip_read(zf, zf.getinfo(names_lower[toml_name]), 262144).decode(
+                        "utf-8", errors="replace"
+                    )
                     for m in re.finditer(r'modId\s*=\s*["\']([^"\']+)["\']', raw):
                         mod_ids.append(m.group(1))
                     for m in re.finditer(r'displayName\s*=\s*["\']([^"\']+)["\']', raw):
                         mod_names.append(m.group(1))
-                except Exception:
+                except (OSError, ValueError, zipfile.BadZipFile, KeyError, zlib.error):
                     pass
 
         meta_joined = " ".join(mod_ids + mod_names + mod_entrypoints)
@@ -1222,33 +1227,7 @@ def _analyze_jar_zip(
             )
 
         # Spoofed popular mod filename check
-        base_low = os.path.basename(display_path).lower()
-        if mod_ids or mod_names or mod_entrypoints:
-            all_identity = f"{' '.join(mod_ids)} {' '.join(mod_names)} {' '.join(mod_entrypoints)}".lower()
-            for brand, expected_tokens in POPULAR_MOD_IDENTITY_MAP.items():
-                if brand in base_low and not any(tok in all_identity for tok in expected_tokens):
-                    ctx.add_finding(
-                        Finding(
-                            rule_id="E4-JAR-SPOOFED-MOD-NAME",
-                            engine=ENGINE_NAME,
-                            severity=Severity.CRITICAL,
-                            confidence=Confidence.CONFIRMED,
-                            category="Renamed / Spoofed Mod",
-                            title=f"Sahte isimli mod tespit edildi: '{os.path.basename(display_path)}' aslinda '{', '.join(mod_ids or mod_names)}'",
-                            description=(
-                                f"Dosya adi '{brand}' gibi mesru bir mod adi kullaniyor ancak icindeki metadata/paket "
-                                "baska bir mod veya hile oldugunu gosteriyor."
-                            ),
-                            evidence=[
-                                f"Dosya adi: {os.path.basename(display_path)}",
-                                f"Gercek Mod ID: {', '.join(mod_ids)}",
-                                f"Gercek Mod Adi: {', '.join(mod_names)}",
-                                f"Entrypoint: {', '.join(mod_entrypoints[:5])}",
-                            ],
-                            path=display_path,
-                        )
-                    )
-                    break
+        _check_spoofed_mod_name(ctx, display_path, mod_ids, mod_names, mod_entrypoints)
 
         if manifest_agents:
             ctx.add_finding(
@@ -1279,7 +1258,7 @@ def _analyze_jar_zip(
 
             if fn_low.endswith(".jar") and depth < 2 and info.file_size <= 16 * 1024 * 1024:
                 try:
-                    nested_bytes = zf.read(info)
+                    nested_bytes = safe_zip_read(zf, info, 16 * 1024 * 1024)
                     _analyze_jar_bytes(
                         ctx,
                         f"{display_path}!/{fn}",
@@ -1287,17 +1266,17 @@ def _analyze_jar_zip(
                         depth=depth + 1,
                         clean_jar_digests=clean_jar_digests,
                     )
-                except Exception:
+                except (OSError, ValueError, zipfile.BadZipFile, zlib.error):
                     pass
                 continue
 
             if "mixin" in fn_low and fn_low.endswith(".json") and info.file_size <= 512 * 1024:
                 try:
-                    mtxt = zf.read(info).decode("utf-8", errors="replace")
+                    mtxt = safe_zip_read(zf, info, 512 * 1024).decode("utf-8", errors="replace")
                     s_m, h_m, _ = match_cheat_signatures(mtxt)
                     if s_m or h_m:
                         mixin_suspects.append(f"{fn}: {', '.join(s_m + h_m)}")
-                except Exception:
+                except (OSError, ValueError, zipfile.BadZipFile, zlib.error):
                     pass
                 continue
 
@@ -1346,8 +1325,8 @@ def _analyze_jar_zip(
         for info in class_infos:
             fn = info.filename
             try:
-                cdata = zf.read(info)
-            except Exception:
+                cdata = safe_zip_read(zf, info, 2 * 1024 * 1024)
+            except (OSError, ValueError, zipfile.BadZipFile, zlib.error):
                 continue
 
             if _CLASS_BYTES_PREFILTER_RE.search(cdata) is None:
@@ -1692,15 +1671,17 @@ def _analyze_zip_resource_pack(
                 and ("textures/block/" in fn_low or "textures/blocks/" in fn_low)
             ) or "lightmap" in fn_low:
                 try:
-                    _inspect_png_for_xray_or_fullbright(ctx, f"{display_path}!/{info.filename}", fn_low, zf.read(info))
-                except Exception:
+                    raw_png = safe_zip_read(zf, info, 8 * 1024 * 1024)
+                    _inspect_png_for_xray_or_fullbright(ctx, f"{display_path}!/{info.filename}", fn_low, raw_png)
+                except (OSError, ValueError, zipfile.BadZipFile, zlib.error):
                     pass
         elif fn_low.endswith(".json") and ("models/block/" in fn_low or "blockstates/" in fn_low):
             try:
+                raw_json = safe_zip_read(zf, info, 2 * 1024 * 1024).decode("utf-8", errors="replace")
                 _inspect_block_model_json_for_xray(
-                    ctx, f"{display_path}!/{info.filename}", fn_low, zf.read(info).decode("utf-8", errors="replace")
+                    ctx, f"{display_path}!/{info.filename}", fn_low, raw_json
                 )
-            except Exception:
+            except (OSError, ValueError, zipfile.BadZipFile, zlib.error):
                 pass
 
 
@@ -1713,8 +1694,8 @@ def _analyze_zip_shader_pack(
         fn_low = info.filename.lower()
         if fn_low.endswith((".fsh", ".vsh", ".glsl")):
             try:
-                txt = zf.read(info).decode("utf-8", errors="replace")
-            except Exception:
+                txt = safe_zip_read(zf, info, 2 * 1024 * 1024).decode("utf-8", errors="replace")
+            except (OSError, ValueError, zipfile.BadZipFile, zlib.error):
                 continue
             m = SHADER_XRAY_RE.search(txt)
             if m:
@@ -2030,6 +2011,10 @@ def _check_symlinks_in_mc_dirs(ctx: ScanContext, mc_dirs: list[Path]) -> None:
     for base in mc_dirs:
         if not base.is_dir():
             continue
+        try:
+            base_res = base.resolve()
+        except OSError:
+            base_res = base
         for sub in ("mods", "resourcepacks", "shaderpacks", "config"):
             target_dir = base / sub
             if not target_dir.is_dir():
@@ -2043,8 +2028,11 @@ def _check_symlinks_in_mc_dirs(ctx: ScanContext, mc_dirs: list[Path]) -> None:
                         except OSError:
                             dest = "?"
                             resolved = Path("?")
-                        rstr = str(resolved).lower()
-                        if any(k in rstr for k in ("/tmp/", "/dev/shm/", "/var/tmp/", "/.")) or not str(resolved).startswith(str(base)):
+                        try:
+                            inside_base = resolved.is_relative_to(base_res)
+                        except (OSError, ValueError):
+                            inside_base = False
+                        if (not inside_base) or resolved.name.startswith("."):
                             ctx.add_finding(
                                 Finding(
                                     rule_id="E4-MC-SUSPICIOUS-SYMLINK",
@@ -2256,6 +2244,14 @@ def run(ctx: ScanContext) -> None:
                             inspect_single_file(ctx, fp, is_mc_dir=False, clean_jar_digests=clean_jar_digests)
 
         ctx.telemetry["engine4_files_deep_scanned"] = len(scanned_real)
+        ctx.set_coverage(
+            "E4.deep_files",
+            ScanStatus.COMPLETED,
+            f"Deep scanned {len(scanned_real)} files across {len(expanded_mc_dirs)} MC root(s)",
+        )
         emit_scan_progress(ctx, 1.0, f"Derin dosya taramasi tamamlandi ({len(scanned_real)} dosya).")
     except Exception as exc:
+        if exc.__class__.__name__ == "ScanCancelledError":
+            raise
+        ctx.set_coverage("E4.deep_files", ScanStatus.ERROR, str(exc))
         ctx.add_error(ENGINE_NAME, f"Beklenmeyen hata: {exc}")

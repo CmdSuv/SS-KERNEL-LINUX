@@ -192,11 +192,44 @@ TRUSTED_BIN_DIRS: tuple[str, ...] = (
     "/usr/sbin",
     "/sbin",
     "/usr/local/bin",
+    "/usr/local/sbin",
     "/home/linuxbrew/.linuxbrew/bin",
 )
 
 
+def sanitized_subproc_env(preserve_display: bool = True) -> dict[str, str]:
+    """Return a clean subprocess environment free of linker/JVM injection variables."""
+    env = os.environ.copy()
+    for bad_var in (
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "LD_DEBUG",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "PYTHONPATH",
+        "PYTHONHOME",
+    ):
+        env.pop(bad_var, None)
+    if "LD_LIBRARY_PATH_ORIG" in env:
+        orig_lp = env.pop("LD_LIBRARY_PATH_ORIG", "")
+        if orig_lp:
+            env["LD_LIBRARY_PATH"] = orig_lp
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    elif getattr(sys, "frozen", False):
+        env.pop("LD_LIBRARY_PATH", None)
+    env["PATH"] = ":".join(TRUSTED_BIN_DIRS)
+    env["LC_ALL"] = "C"
+    if not preserve_display:
+        env.pop("DISPLAY", None)
+        env.pop("WAYLAND_DISPLAY", None)
+    return env
+
+
 def trusted_which(name: str) -> str | None:
+    if not name or "/" in name or "\x00" in name:
+        return None
     for d in TRUSTED_BIN_DIRS:
         candidate = Path(d) / name
         try:
@@ -217,8 +250,7 @@ def run_trusted_cmd(cmd: list[str], timeout: float = 4.0) -> tuple[int, str, str
         if not resolved:
             return -1, "", f"binary not found in trusted dirs: {exe}"
         cmd = [resolved, *cmd[1:]]
-    env = os.environ.copy()
-    env["LC_ALL"] = "C"
+    env = sanitized_subproc_env()
     try:
         proc = subprocess.run(
             cmd,
@@ -248,6 +280,25 @@ def safe_read_bytes(path: Path, max_bytes: int = 32 * 1024 * 1024) -> bytes:
 
 def safe_read_text(path: Path, max_bytes: int = 8 * 1024 * 1024) -> str:
     raw = safe_read_bytes(path, max_bytes=max_bytes)
+    return raw.decode("utf-8", errors="replace")
+
+
+def safe_read_tail_bytes(path: Path, max_bytes: int = 2 * 1024 * 1024) -> bytes:
+    """Read up to the final max_bytes of a regular file (seeks cleanly without reading from byte 0)."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode):
+            return b""
+        with open(path, "rb") as fh:
+            if st.st_size > max_bytes > 0:
+                fh.seek(st.st_size - max_bytes)
+            return fh.read(max_bytes)
+    except OSError:
+        return b""
+
+
+def safe_read_tail_text(path: Path, max_bytes: int = 2 * 1024 * 1024) -> str:
+    raw = safe_read_tail_bytes(path, max_bytes=max_bytes)
     return raw.decode("utf-8", errors="replace")
 
 
@@ -679,14 +730,31 @@ def iter_files_safe(
                 continue
 
 
+def safe_zip_read(zf: object, info: object, max_bytes: int) -> bytes:
+    """Bounded ZIP entry read that prevents forged-header decompression bombs."""
+    open_fn = getattr(zf, "open", None)
+    if open_fn is None:
+        return b""
+    with open_fn(info) as zfh:
+        data = zfh.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f"ZIP entry exceeds bounded size limit ({max_bytes} bytes)")
+    return data
+
+
 def emit_scan_progress(ctx: ScanContext, fraction: float, message: str) -> None:
     """Safely notify optional orchestrator sub-progress hook (0.0..1.0)."""
+    if ctx.is_cancelled():
+        from .orchestrator import ScanCancelledError
+
+        raise ScanCancelledError("Tarama kullanici tarafindan iptal edildi.")
     cb: Callable[[float, str], None] | None = getattr(ctx, "_engine_progress_cb", None)
     if cb is not None:
         try:
             cb(max(0.0, min(1.0, float(fraction))), message)
-        except Exception:
-            pass
+        except Exception as exc:
+            if exc.__class__.__name__ == "ScanCancelledError":
+                raise
 
 
 def record_scan_region(ctx: ScanContext, engine_code: str, region: str) -> None:
@@ -698,8 +766,22 @@ def record_scan_region(ctx: ScanContext, engine_code: str, region: str) -> None:
 
 
 def resolve_desktop_dir(home_dir: Path | None = None) -> Path:
-    """Resolve user Desktop directory via xdg-user-dir or locale fallbacks."""
+    """Resolve user Desktop directory via user-dirs.dirs, xdg-user-dir, or locale fallbacks."""
     base = home_dir if home_dir is not None else Path.home()
+    user_dirs = base / ".config" / "user-dirs.dirs"
+    if user_dirs.is_file():
+        try:
+            for line in user_dirs.read_text(encoding="utf-8", errors="ignore").splitlines():
+                s = line.strip()
+                if s.startswith("XDG_DESKTOP_DIR="):
+                    raw_val = s.split("=", 1)[1].strip().strip('"').strip("'")
+                    raw_val = raw_val.replace("$HOME", str(base)).replace("${HOME}", str(base))
+                    cand = Path(raw_val)
+                    if cand.is_dir():
+                        return cand
+        except OSError:
+            pass
+
     try:
         same_home = base.resolve() == Path.home().resolve()
     except OSError:

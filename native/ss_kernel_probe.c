@@ -22,6 +22,7 @@
 #include <linux/version.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,6 +118,17 @@ struct vmlinux_btf_index {
 
 static struct vmlinux_btf_index g_btf_idx = {0};
 
+static void free_vmlinux_btf(void)
+{
+	free(g_btf_idx.str_sec);
+	free(g_btf_idx.name_offs);
+	g_btf_idx.str_sec = NULL;
+	g_btf_idx.name_offs = NULL;
+	g_btf_idx.str_len = 0;
+	g_btf_idx.num_types = 0;
+	g_btf_idx.attempted = 0;
+}
+
 static int load_vmlinux_btf(void)
 {
 	int fd;
@@ -148,7 +160,12 @@ static int load_vmlinux_btf(void)
 	}
 	while (total < (size_t)st.st_size) {
 		nread = read(fd, buf + total, (size_t)st.st_size - total);
-		if (nread <= 0)
+		if (nread < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (nread == 0)
 			break;
 		total += (size_t)nread;
 	}
@@ -396,8 +413,11 @@ static void emit_bpf_section(void)
 
 		memset(&attr, 0, sizeof(attr));
 		attr.start_id = id;
-		if (sys_bpf(BPF_MAP_GET_NEXT_ID, &attr, sizeof(attr)) < 0)
+		if (sys_bpf(BPF_MAP_GET_NEXT_ID, &attr, sizeof(attr)) < 0) {
+			if (errno != ENOENT && err_code == 0)
+				err_code = errno;
 			break;
+		}
 		id = attr.next_id;
 
 		memset(&attr, 0, sizeof(attr));
@@ -437,8 +457,11 @@ static void emit_bpf_section(void)
 
 		memset(&attr, 0, sizeof(attr));
 		attr.start_id = id;
-		if (sys_bpf(BPF_LINK_GET_NEXT_ID, &attr, sizeof(attr)) < 0)
+		if (sys_bpf(BPF_LINK_GET_NEXT_ID, &attr, sizeof(attr)) < 0) {
+			if (errno != ENOENT && err_code == 0)
+				err_code = errno;
 			break;
+		}
 		id = attr.next_id;
 
 		memset(&attr, 0, sizeof(attr));
@@ -555,6 +578,7 @@ static void emit_bpf_section(void)
 		close(fd);
 	}
 	printf("\n    ],\n");
+	printf("    \"euid\": %u,\n", (unsigned int)geteuid());
 	printf("    \"errno\": %d\n", err_code);
 	printf("  }");
 }
@@ -582,6 +606,58 @@ struct ss_linux_dirent64 {
 	uint8_t  d_type;
 	char     d_name[];
 };
+
+static bool detect_proc_hidepid(void)
+{
+	FILE *fp = fopen("/proc/self/mountinfo", "r");
+	char line[1024];
+	bool hidden = false;
+
+	if (!fp)
+		fp = fopen("/proc/mounts", "r");
+	if (!fp)
+		return false;
+
+	while (fgets(line, sizeof(line), fp)) {
+		if (strstr(line, " /proc ") != NULL) {
+			if (strstr(line, "hidepid=1") != NULL ||
+			    strstr(line, "hidepid=2") != NULL ||
+			    strstr(line, "hidepid=4") != NULL ||
+			    strstr(line, "hidepid=ptraceable") != NULL ||
+			    strstr(line, "hidepid=invisible") != NULL ||
+			    strstr(line, "hidepid=noaccess") != NULL) {
+				hidden = true;
+				break;
+			}
+		}
+	}
+	fclose(fp);
+	return hidden;
+}
+
+static bool proc_readdir_has_pid(long target_pid)
+{
+	DIR *d = opendir("/proc");
+	struct dirent *de;
+	bool found = false;
+
+	if (!d)
+		return false;
+	while ((de = readdir(d)) != NULL) {
+		char *endp = NULL;
+		long p;
+
+		if (!isdigit((unsigned char)de->d_name[0]))
+			continue;
+		p = strtol(de->d_name, &endp, 10);
+		if (endp && *endp == '\0' && p == target_pid) {
+			found = true;
+			break;
+		}
+	}
+	closedir(d);
+	return found;
+}
 
 static int read_tgid_from_status(const char *status_path)
 {
@@ -612,6 +688,8 @@ static void emit_pid_cross_section(void)
 	unsigned int readdir_count = 0;
 	unsigned int raw_getdents_count = 0;
 	unsigned int hidden_count = 0;
+	unsigned int euid = (unsigned int)geteuid();
+	bool hidepid = detect_proc_hidepid();
 	struct stat init_st;
 	bool proc_sane;
 
@@ -645,38 +723,55 @@ static void emit_pid_cross_section(void)
 
 	/* 2. Direct SYS_getdents64("/proc") pass to defeat LD_PRELOAD readdir() wrappers */
 	{
-		int pfd = open("/proc", O_RDONLY | O_DIRECTORY);
+		int pfd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 
 		if (pfd >= 0) {
-			char gbuf[16384];
+			_Alignas(8) char gbuf[16384];
 
 			for (;;) {
 				long nread = syscall(__NR_getdents64, pfd, gbuf, sizeof(gbuf));
 				long bpos = 0;
 
-				if (nread <= 0)
+				if (nread < 0) {
+					if (errno == EINTR)
+						continue;
 					break;
-				while (bpos < nread) {
-					struct ss_linux_dirent64 *ent =
-						(struct ss_linux_dirent64 *)(gbuf + bpos);
-					if (ent->d_reclen == 0)
+				}
+				if (nread == 0)
+					break;
+				while (bpos + (long)sizeof(struct ss_linux_dirent64) <= nread) {
+					struct ss_linux_dirent64 hdr;
+					const char *name_ptr;
+					size_t name_off = offsetof(struct ss_linux_dirent64, d_name);
+					size_t max_name;
+					const void *nul;
+
+					memcpy(&hdr, gbuf + bpos, sizeof(hdr));
+					if (hdr.d_reclen < name_off + 1U ||
+					    bpos + (long)hdr.d_reclen > nread)
 						break;
-					if (isdigit((unsigned char)ent->d_name[0])) {
+
+					name_ptr = gbuf + bpos + (long)name_off;
+					max_name = (size_t)hdr.d_reclen - name_off;
+					nul = memchr(name_ptr, '\0', max_name);
+					if (nul && isdigit((unsigned char)name_ptr[0])) {
 						char *endp = NULL;
-						long p = strtol(ent->d_name, &endp, 10);
+						long p = strtol(name_ptr, &endp, 10);
 
 						if (endp && *endp == '\0' && p > 0 && p <= pid_cap) {
 							seen_raw[p] = 1;
 							raw_getdents_count++;
 						}
 					}
-					bpos += ent->d_reclen;
+					bpos += (long)hdr.d_reclen;
 				}
 			}
 			close(pfd);
 		}
 	}
 
+	printf("    \"euid\": %u,\n", euid);
+	printf("    \"hidepid_detected\": %d,\n", hidepid ? 1 : 0);
 	printf("    \"readdir_count\": %u,\n", readdir_count);
 	printf("    \"raw_getdents_count\": %u,\n", raw_getdents_count);
 	printf("    \"pid_sweep_cap\": %ld,\n", pid_cap);
@@ -686,26 +781,33 @@ static void emit_pid_cross_section(void)
 		char pbuf[64];
 		struct stat st;
 		int k_rc;
+		int k_err;
 		int s_rc;
+		int s_err;
 		int tgid_check = -1;
 		bool raw_only = (seen_raw[pid] && !seen[pid]);
 
 		if (seen[pid] && seen_raw[pid])
 			continue;
 
+		errno = 0;
 		k_rc = kill((pid_t)pid, 0);
-		if (k_rc != 0 && errno != EPERM)
+		k_err = errno;
+		if (k_rc != 0 && k_err != EPERM)
 			continue;
 
 		snprintf(pbuf, sizeof(pbuf), "/proc/%ld/status", pid);
+		errno = 0;
 		s_rc = stat(pbuf, &st);
+		s_err = errno;
 		if (s_rc == 0)
 			tgid_check = read_tgid_from_status(pbuf);
 
 		if (raw_only || (s_rc == 0 && tgid_check == (int)pid)) {
 			/* Case A: LD_PRELOAD readdir cloak or LKM /proc readdir cloak while /proc/<pid> exists */
 			usleep(200);
-			if (kill((pid_t)pid, 0) == 0 || errno == EPERM) {
+			if (!proc_readdir_has_pid(pid) &&
+			    (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
 				char dirbuf[64];
 
 				snprintf(dirbuf, sizeof(dirbuf), "/proc/%ld", pid);
@@ -719,13 +821,19 @@ static void emit_pid_cross_section(void)
 					       pid, tgid_check, raw_only ? 1 : 0);
 				}
 			}
-		} else if (s_rc != 0 && errno == ENOENT) {
+		} else if (s_rc != 0 && s_err == ENOENT) {
+			/* Skip Case B for unprivileged scans under hidepid=1/2 where /proc/<other-uid> returns ENOENT */
+			if (hidepid && euid != 0 && k_rc != 0)
+				continue;
 			/* Case B: Hooked BOTH readdir AND /proc/<pid>/status ENOENT while kill(pid,0) succeeds */
 			usleep(200);
-			if (kill((pid_t)pid, 0) == 0 || errno == EPERM) {
+			if (!proc_readdir_has_pid(pid) &&
+			    (kill((pid_t)pid, 0) == 0 || errno == EPERM)) {
 				struct stat st2;
-				int s_rc2 = stat(pbuf, &st2);
+				int s_rc2;
 
+				errno = 0;
+				s_rc2 = stat(pbuf, &st2);
 				if (s_rc2 != 0 && errno == ENOENT) {
 					if (!hidden_first)
 						putchar(',');
@@ -744,6 +852,25 @@ static void emit_pid_cross_section(void)
 	free(seen);
 }
 
+static ssize_t read_all_fd(int fd, uint8_t *buf, size_t cap)
+{
+	size_t total = 0;
+
+	while (total < cap) {
+		ssize_t r = read(fd, buf + total, cap - total);
+
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			break;
+		}
+		if (r == 0)
+			break;
+		total += (size_t)r;
+	}
+	return (ssize_t)total;
+}
+
 static void emit_pci_extended_section(void)
 {
 	DIR *d = opendir("/sys/bus/pci/devices");
@@ -757,9 +884,11 @@ static void emit_pci_extended_section(void)
 			uint8_t cfg[4096];
 			ssize_t nread;
 			int fd;
+			int path_len;
 			uint16_t vid, did, cmd, status;
 			uint8_t cap_pos, hops = 0;
 			int cap_loop = 0;
+			int ext_cap_loop = 0;
 			uint16_t ext_pos = 0x100;
 			uint16_t ext_caps[32];
 			int ext_cnt = 0;
@@ -767,13 +896,16 @@ static void emit_pci_extended_section(void)
 
 			if (de->d_name[0] == '.')
 				continue;
-			snprintf(cfg_path, sizeof(cfg_path), "/sys/bus/pci/devices/%s/config", de->d_name);
-			fd = open(cfg_path, O_RDONLY);
+			path_len = snprintf(cfg_path, sizeof(cfg_path),
+					    "/sys/bus/pci/devices/%s/config", de->d_name);
+			if (path_len < 0 || (size_t)path_len >= sizeof(cfg_path))
+				continue;
+			fd = open(cfg_path, O_RDONLY | O_CLOEXEC);
 			if (fd < 0)
 				continue;
 
 			memset(cfg, 0, sizeof(cfg));
-			nread = read(fd, cfg, sizeof(cfg));
+			nread = read_all_fd(fd, cfg, sizeof(cfg));
 			close(fd);
 			if (nread < 64)
 				continue;
@@ -809,11 +941,21 @@ static void emit_pci_extended_section(void)
 
 			/* Walk PCIe Extended Capabilities (offsets 0x100..0xFFC) */
 			if (vid != 0xffffU && nread >= 0x104) {
+				uint8_t ext_visited[120] = { 0 }; /* covers (0x100..0xffc) >> 2 */
 				int e_hops = 0;
 
-				while (ext_pos >= 0x100 && (size_t)ext_pos + 4 <= (size_t)nread && e_hops < 32) {
+				while (ext_pos >= 0x100 && (size_t)ext_pos + 4 <= (size_t)nread && e_hops < 64) {
 					uint32_t hdr = 0;
 					uint16_t ec_id, ec_next;
+					unsigned int eslot = (unsigned int)(ext_pos - 0x100U) >> 2;
+
+					if (eslot >= 960U)
+						break;
+					if (ext_visited[eslot >> 3] & (uint8_t)(1U << (eslot & 7U))) {
+						ext_cap_loop = 1;
+						break;
+					}
+					ext_visited[eslot >> 3] |= (uint8_t)(1U << (eslot & 7U));
 
 					memcpy(&hdr, cfg + ext_pos, 4);
 					if (hdr == 0 || hdr == 0xffffffffU)
@@ -822,11 +964,17 @@ static void emit_pci_extended_section(void)
 					ec_next = (uint16_t)((hdr >> 20) & 0xffcU);
 					if (ext_cnt < 32)
 						ext_caps[ext_cnt++] = ec_id;
-					if (ec_next == 0 || ec_next == ext_pos)
+					if (ec_next == 0)
 						break;
+					if (ec_next == ext_pos || ec_next < 0x100U) {
+						ext_cap_loop = 1;
+						break;
+					}
 					ext_pos = ec_next;
 					e_hops++;
 				}
+				if (e_hops >= 64)
+					ext_cap_loop = 1;
 			}
 
 			if (!first)
@@ -834,8 +982,8 @@ static void emit_pci_extended_section(void)
 			first = 0;
 			printf("\n    {\"bdf\": ");
 			print_json_str(de->d_name);
-			printf(", \"cfg_bytes\": %zd, \"vid\": \"0x%04x\", \"did\": \"0x%04x\", \"cmd\": \"0x%04x\", \"cap_loop\": %d, \"ext_cap_ids\": [",
-			       nread, vid, did, cmd, cap_loop);
+			printf(", \"cfg_bytes\": %zd, \"vid\": \"0x%04x\", \"did\": \"0x%04x\", \"cmd\": \"0x%04x\", \"cap_loop\": %d, \"ext_cap_loop\": %d, \"ext_cap_ids\": [",
+			       nread, vid, did, cmd, cap_loop, ext_cap_loop);
 			for (ec = 0; ec < ext_cnt; ec++)
 				printf("%s%u", ec ? "," : "", ext_caps[ec]);
 			printf("]}");
@@ -849,22 +997,25 @@ int main(int argc, char **argv)
 {
 	const char *mode = (argc > 1) ? argv[1] : "all";
 
-	if (strcmp(mode, "bpf-dump") == 0) {
+	if (strcmp(mode, "bpf-dump") == 0 || strcmp(mode, "bpf_dump") == 0) {
 		printf("{\n");
 		emit_bpf_section();
 		printf("\n}\n");
+		free_vmlinux_btf();
 		return 0;
 	}
-	if (strcmp(mode, "pid-cross") == 0) {
+	if (strcmp(mode, "pid-cross") == 0 || strcmp(mode, "pid_cross") == 0) {
 		printf("{\n");
 		emit_pid_cross_section();
 		printf("\n}\n");
+		free_vmlinux_btf();
 		return 0;
 	}
-	if (strcmp(mode, "pci-dump") == 0) {
+	if (strcmp(mode, "pci-dump") == 0 || strcmp(mode, "pci_dump") == 0) {
 		printf("{\n");
 		emit_pci_extended_section();
 		printf("\n}\n");
+		free_vmlinux_btf();
 		return 0;
 	}
 
@@ -875,5 +1026,6 @@ int main(int argc, char **argv)
 	printf(",\n");
 	emit_pci_extended_section();
 	printf("\n}\n");
+	free_vmlinux_btf();
 	return 0;
 }

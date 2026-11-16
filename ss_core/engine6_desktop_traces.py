@@ -14,12 +14,13 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import Confidence, Finding, ScanContext, Severity
+from .models import Confidence, Finding, ScanContext, ScanStatus, Severity
 from .signatures import CHEAT_DOMAINS, SUSPICIOUS_UNVERIFIED_MOD_ORIGINS
 from .utils import (
     copy_sqlite_with_sidecars,
     discover_browser_databases,
     emit_scan_progress,
+    iter_files_safe,
     match_cheat_signatures,
     record_scan_region,
     rot13,
@@ -104,13 +105,22 @@ def _check_recently_used(ctx: ScanContext) -> None:
         exists = fpath.exists()
         low = fpath_str.lower()
         strict, high_ctx, _ = match_cheat_signatures(fpath_str)
-        is_suspect_ext = low.endswith((".jar", ".so", ".dll", ".exe", ".appimage", ".class"))
+        is_suspect_ext = low.endswith((".jar", ".so", ".dll", ".exe", ".appimage", ".class", ".sh", ".py"))
         in_tmp = any(t in low for t in ("/tmp/", "/dev/shm/", "/var/tmp/"))
+        is_benign_tmp_doc = (
+            "/tmp/mozilla_" in low
+            or "/tmp/.org.chromium" in low
+            or Path(low).suffix in {
+                ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp",
+                ".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm",
+                ".docx", ".xlsx", ".pptx", ".odt", ".mp3", ".mp4", ".mkv", ".webm", ".log",
+            }
+        )
 
         if strict or high_ctx:
             msg = f"{fpath_str} (modified={modified}, diskte={'VAR' if exists else 'SILINMIS'})"
             (active_suspicious if exists else deleted_suspicious).append(msg)
-        elif not exists and (is_suspect_ext or in_tmp):
+        elif not exists and (is_suspect_ext or (in_tmp and not is_benign_tmp_doc)):
             deleted_suspicious.append(f"{fpath_str} (modified={modified}, diskten SILINMIS)")
 
     if deleted_suspicious:
@@ -350,6 +360,7 @@ def _check_browsers(ctx: ScanContext) -> None:
             dl_hits: list[str] = []
             total_urls = 0
             recent_count = 0
+            sql_ok = False
 
             try:
                 conn = sqlite3.connect(f"file:{snap}?mode=ro", uri=True)
@@ -357,6 +368,7 @@ def _check_browsers(ctx: ScanContext) -> None:
                 if btype == "chromium":
                     cur.execute("SELECT COUNT(*) FROM urls")
                     total_urls = cur.fetchone()[0]
+                    sql_ok = True
                     cutoff_wk = int((now - win_sec + WEBKIT_EPOCH_OFFSET_SEC) * 1_000_000)
                     cur.execute("SELECT COUNT(*) FROM urls WHERE last_visit_time >= ?", (cutoff_wk,))
                     recent_count = cur.fetchone()[0]
@@ -397,10 +409,13 @@ def _check_browsers(ctx: ScanContext) -> None:
                             "ORDER BY d.start_time DESC LIMIT 5000"
                         )
                     except sqlite3.Error:
-                        cur.execute(
-                            "SELECT tab_url, '', target_path, start_time FROM downloads "
-                            "ORDER BY start_time DESC LIMIT 5000"
-                        )
+                        try:
+                            cur.execute(
+                                "SELECT tab_url, '', target_path, start_time FROM downloads "
+                                "ORDER BY start_time DESC LIMIT 5000"
+                            )
+                        except sqlite3.Error:
+                            cur.execute("SELECT NULL, '', NULL, 0 WHERE 0")
                     for tab_url, chain_url, target_path, st_time in cur.fetchall():
                         combo = f"{tab_url or ''} {chain_url or ''} {target_path or ''}"
                         clow = combo.lower()
@@ -417,6 +432,7 @@ def _check_browsers(ctx: ScanContext) -> None:
                 elif btype == "firefox":
                     cur.execute("SELECT COUNT(*) FROM moz_places")
                     total_urls = cur.fetchone()[0]
+                    sql_ok = True
                     cutoff_pr = int((now - win_sec) * 1_000_000)
                     cur.execute("SELECT COUNT(*) FROM moz_places WHERE last_visit_date >= ?", (cutoff_pr,))
                     recent_count = cur.fetchone()[0]
@@ -496,7 +512,7 @@ def _check_browsers(ctx: ScanContext) -> None:
 
             # History wipe detection: flag only if recently modified within scan window (avoids unused browser profiles)
             db_recent = ts is not None and (now - (ts.mtime_ns / 1e9)) <= win_sec
-            if db_recent and (total_urls <= 3 or (db_size < 102400 and total_urls < 15)):
+            if sql_ok and db_recent and (total_urls <= 3 or (db_size < 102400 and total_urls < 15)):
                 ctx.add_finding(
                     Finding(
                         rule_id="E6-BROWSER-HISTORY-WIPED",
@@ -664,7 +680,9 @@ def _check_java_userprefs_and_autostart(ctx: ScanContext) -> None:
     uprefs = h / ".java/.userPrefs"
     if uprefs.is_dir():
         hits: list[str] = []
-        for xf in uprefs.rglob("*.xml"):
+        for xf in iter_files_safe(uprefs, max_depth=8, follow_symlinks=False):
+            if xf.suffix.lower() != ".xml":
+                continue
             txt = safe_read_text(xf, 128 * 1024)
             s, h_ctx, _ = match_cheat_signatures(f"{xf} {txt}")
             if s or h_ctx:
@@ -688,9 +706,7 @@ def _check_java_userprefs_and_autostart(ctx: ScanContext) -> None:
     for adir in (h / ".config/autostart", h / ".config/systemd/user"):
         if not adir.is_dir():
             continue
-        for f in adir.rglob("*"):
-            if not f.is_file():
-                continue
+        for f in iter_files_safe(adir, max_depth=6, follow_symlinks=False):
             txt = safe_read_text(f, 65536)
             low = txt.lower()
             if any(k in low for k in ("xdotool", "ydotool", "dotool", "xclicker", "/tmp/", "/dev/shm/")) or any(
@@ -732,6 +748,10 @@ def run(ctx: ScanContext) -> None:
         emit_scan_progress(ctx, 0.94, "Java UserPrefs ve autostart kayitlari kontrol ediliyor...")
         _check_java_userprefs_and_autostart(ctx)
         record_scan_region(ctx, "E6", f"{ctx.home_dir}/.java/.userPrefs ve .config/autostart")
+        ctx.set_coverage("E6.desktop_traces", ScanStatus.COMPLETED, "Desktop, Trash, Wine, Browser artifacts checked")
         emit_scan_progress(ctx, 1.0, "Masaustu ve tarayici izleri tamamlandi.")
     except Exception as exc:
+        if exc.__class__.__name__ == "ScanCancelledError":
+            raise
+        ctx.set_coverage("E6.desktop_traces", ScanStatus.ERROR, str(exc))
         ctx.add_error(ENGINE_NAME, f"Beklenmeyen hata: {exc}")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -23,6 +24,42 @@ from .distro_profiles import (
     format_kernel_headers_install_hint,
     resolve_profile,
 )
+from .utils import sanitized_subproc_env
+
+_PRIV_TRUSTED_DIRS: tuple[str, ...] = (
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+)
+_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+
+
+def _trusted_bin(name: str) -> str | None:
+    if not name or "/" in name or "\x00" in name:
+        return None
+    is_root = os.geteuid() == 0
+    for d in _PRIV_TRUSTED_DIRS:
+        cand = Path(d) / name
+        try:
+            st = cand.stat()
+            if stat.S_ISREG(st.st_mode) and os.access(cand, os.X_OK):
+                if is_root and st.st_uid != 0:
+                    continue
+                return str(cand)
+        except OSError:
+            continue
+    return None
+
+
+def _clean_priv_env(preserve_display: bool = False) -> dict[str, str]:
+    env = sanitized_subproc_env(preserve_display=preserve_display)
+    env["PATH"] = ":".join(_PRIV_TRUSTED_DIRS)
+    for k in ("PERL5LIB", "PERL5OPT", "BASH_ENV", "ENV", "IFS", "CDPATH", "PYTHONINSPECT", "PYTHONUSERBASE"):
+        env.pop(k, None)
+    return env
 
 
 def _bundle_root() -> Path:
@@ -48,51 +85,257 @@ def _invoker_home() -> Path:
         return Path.home()
 
 
-def _is_trusted_artifact(candidate: Path, require_exec: bool = False) -> bool:
-    """Verify binary/.ko ownership and directory safety before root execution/insmod."""
+def _is_under_unprivileged_local_share(resolved: Path) -> bool:
+    """Reject per-user ~/.local artifacts when elevated as root from an unprivileged session."""
+    if os.geteuid() != 0 or _invoker_uid() == 0:
+        return False
     try:
-        resolved = candidate.resolve(strict=True)
-        st = os.stat(resolved)
-        parent_st = os.stat(resolved.parent)
+        inv_local = (_invoker_home() / ".local").resolve(strict=False)
+        return resolved == inv_local or resolved.is_relative_to(inv_local)
     except OSError:
-        return False
+        return True
 
-    if not stat.S_ISREG(st.st_mode):
-        return False
-    if require_exec and not os.access(resolved, os.X_OK):
-        return False
 
-    trusted_uids = {0, os.geteuid(), os.getuid(), _invoker_uid()}
-    if st.st_uid not in trusted_uids or parent_st.st_uid not in trusted_uids:
-        return False
-    # Block world-writable artifacts or world-writable parent directories (e.g. /tmp)
-    if (st.st_mode & stat.S_IWOTH) != 0 or (parent_st.st_mode & stat.S_IWOTH) != 0:
-        return False
-
-    # Optional pinned SHA-256 sidecar verification when packaged
-    sidecar = Path(str(resolved) + ".sha256")
-    if sidecar.is_file():
+def _ancestor_dir_safe(directory: Path, trusted_uids: set[int]) -> bool:
+    cur = directory
+    seen: set[Path] = set()
+    while True:
+        if cur in seen:
+            break
+        seen.add(cur)
         try:
-            expected = sidecar.read_text(encoding="utf-8", errors="ignore").strip().split()[0].lower()
-            if len(expected) == 64:
-                actual = hashlib.sha256(resolved.read_bytes()).hexdigest().lower()
-                if not secrets.compare_digest(expected, actual):
-                    return False
-        except (OSError, IndexError):
+            st = os.stat(cur)
+        except OSError:
             return False
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        if st.st_uid not in trusted_uids:
+            return False
+        is_sticky_root = st.st_uid == 0 and (st.st_mode & stat.S_ISVTX) != 0
+        if (st.st_mode & stat.S_IWOTH) != 0 and not is_sticky_root:
+            return False
+        if (st.st_mode & stat.S_IWGRP) != 0 and st.st_gid not in (0, st.st_uid):
+            return False
+        if cur == cur.parent:
+            break
+        cur = cur.parent
     return True
 
 
+def _embedded_probe_sha256() -> str:
+    try:
+        from . import _self_manifest
+
+        val = getattr(_self_manifest, "NATIVE_PROBE_SHA256", "")
+        return str(val).strip().lower() if isinstance(val, str) else ""
+    except Exception:
+        return ""
+
+
+def _embedded_kernel_sources_sha() -> dict[str, str]:
+    try:
+        from . import _self_manifest
+
+        raw = getattr(_self_manifest, "KERNEL_SOURCES_SHA256", {})
+        if isinstance(raw, dict):
+            return {str(k): str(v).strip().lower() for k, v in raw.items() if isinstance(v, str) and len(v.strip()) == 64}
+    except Exception:
+        pass
+    return {}
+
+
+def _trusted_artifact_uids(allow_manifest_invoker: bool = False) -> set[int]:
+    if os.geteuid() != 0:
+        return {0, os.geteuid(), os.getuid()}
+    if allow_manifest_invoker and not getattr(sys, "frozen", False):
+        inv = _invoker_uid()
+        if inv != 0:
+            return {0, inv}
+    return {0}
+
+
+def _read_sha256_sidecar(sidecar: Path) -> str | None:
+    if not sidecar.exists():
+        return None
+    try:
+        fd = os.open(str(sidecar), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return ""
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 4096:
+            return ""
+        raw = os.read(fd, 4096).decode("utf-8", errors="ignore").strip().split()
+        if raw and len(raw[0]) == 64 and all(c in "0123456789abcdefABCDEF" for c in raw[0]):
+            return raw[0].lower()
+        return ""
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+
+
+def _is_trusted_artifact(
+    candidate: Path,
+    require_exec: bool = False,
+    pinned_sha256: str | None = None,
+) -> bool:
+    """Verify binary/.ko ownership, ancestor directory safety, and SHA-256 sidecar / pinned manifest."""
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return False
+
+    if _is_under_unprivileged_local_share(resolved):
+        return False
+
+    allow_inv = bool(pinned_sha256)
+    trusted_uids = _trusted_artifact_uids(allow_manifest_invoker=allow_inv)
+    if not _ancestor_dir_safe(resolved.parent, trusted_uids):
+        return False
+
+    try:
+        fd = os.open(str(resolved), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_ARTIFACT_BYTES:
+            return False
+        if require_exec and (st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)) == 0:
+            return False
+        if st.st_uid not in trusted_uids:
+            return False
+        if (st.st_mode & stat.S_IWOTH) != 0:
+            return False
+        if (st.st_mode & stat.S_IWGRP) != 0 and st.st_gid not in (0, st.st_uid):
+            return False
+
+        expected = _read_sha256_sidecar(Path(str(resolved) + ".sha256"))
+        if expected is not None and not expected:
+            return False
+        need_hash = (expected is not None) or bool(pinned_sha256) or (os.geteuid() == 0 and st.st_uid != 0)
+        if need_hash:
+            if not pinned_sha256 and os.geteuid() == 0 and st.st_uid != 0:
+                return False
+            h = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+            actual = h.hexdigest().lower()
+            if expected is not None and not secrets.compare_digest(expected, actual):
+                return False
+            if pinned_sha256 and not secrets.compare_digest(pinned_sha256.lower(), actual):
+                return False
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def _stage_verified_artifact(
+    candidate: Path,
+    stage_dir: Path,
+    require_exec: bool = False,
+    pinned_sha256: str | None = None,
+) -> Path | None:
+    """Copy a verified artifact via O_NOFOLLOW FD into a root-owned 0700 stage directory before hash verification."""
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+
+    if _is_under_unprivileged_local_share(resolved):
+        return None
+
+    allow_inv = bool(pinned_sha256)
+    trusted_uids = _trusted_artifact_uids(allow_manifest_invoker=allow_inv)
+    if not _ancestor_dir_safe(resolved.parent, trusted_uids):
+        return None
+
+    sidecar_expected = _read_sha256_sidecar(Path(str(resolved) + ".sha256"))
+    if sidecar_expected == "":
+        return None
+
+    try:
+        in_fd = os.open(str(resolved), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+
+    staged = stage_dir / f"{secrets.token_hex(6)}_{resolved.name}"
+    out_fd = -1
+    try:
+        st = os.fstat(in_fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > _MAX_ARTIFACT_BYTES:
+            return None
+        if require_exec and (st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)) == 0:
+            return None
+        if st.st_uid not in trusted_uids:
+            return None
+        if os.geteuid() == 0 and st.st_uid != 0 and not pinned_sha256:
+            return None
+        if (st.st_mode & stat.S_IWOTH) != 0:
+            return None
+        if (st.st_mode & stat.S_IWGRP) != 0 and st.st_gid not in (0, st.st_uid):
+            return None
+
+        out_fd = os.open(
+            str(staged),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o700 if require_exec else 0o600,
+        )
+        h = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(in_fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_ARTIFACT_BYTES:
+                return None
+            h.update(chunk)
+            os.write(out_fd, chunk)
+        os.fsync(out_fd)
+        actual = h.hexdigest().lower()
+
+        if sidecar_expected is not None and not secrets.compare_digest(sidecar_expected, actual):
+            staged.unlink(missing_ok=True)
+            return None
+        if pinned_sha256 and not secrets.compare_digest(pinned_sha256.lower(), actual):
+            staged.unlink(missing_ok=True)
+            return None
+        return staged
+    except OSError:
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    finally:
+        os.close(in_fd)
+        if out_fd >= 0:
+            try:
+                os.close(out_fd)
+            except OSError:
+                pass
+
+
 def _modinfo_vermagic(ko_path: Path) -> str:
-    if not shutil.which("modinfo"):
+    modinfo_bin = _trusted_bin("modinfo")
+    if not modinfo_bin:
         return ""
     try:
         cp = subprocess.run(
-            ["modinfo", "-F", "vermagic", str(ko_path)],
+            [modinfo_bin, "-F", "vermagic", str(ko_path)],
             capture_output=True,
             text=True,
             timeout=3,
             check=False,
+            env=_clean_priv_env(),
         )
         return (cp.stdout or "").strip()
     except OSError:
@@ -114,18 +357,23 @@ def find_lkm_object(root: Path | None = None, kernel_release: str | None = None)
         ]
     else:
         repo_root = Path(__file__).resolve().parent.parent
-        inv_share = _invoker_home() / ".local" / "share" / "mc-ss-sentinel"
+        sys_cache = Path("/var/cache/mc-ss-sentinel")
         sys_share = Path("/usr/local/share/mc-ss-sentinel")
         candidates = [
             base / "kernel" / "prebuilt" / rel / "mc_ss_kmod.ko",
             repo_root / "kernel" / "prebuilt" / rel / "mc_ss_kmod.ko",
-            inv_share / "kmods" / rel / "mc_ss_kmod.ko",
+            sys_cache / "kmods" / rel / "mc_ss_kmod.ko",
             sys_share / "kmods" / rel / "mc_ss_kmod.ko",
             base / "kernel" / "mc_ss_kmod.ko",
             repo_root / "kernel" / "mc_ss_kmod.ko",
-            inv_share / "mc_ss_kmod.ko",
             sys_share / "mc_ss_kmod.ko",
         ]
+        if not (os.geteuid() == 0 and _invoker_uid() != 0):
+            inv_share = _invoker_home() / ".local" / "share" / "mc-ss-sentinel"
+            candidates.extend([
+                inv_share / "kmods" / rel / "mc_ss_kmod.ko",
+                inv_share / "mc_ss_kmod.ko",
+            ])
     trusted: list[Path] = []
     seen_real: set[Path] = set()
     for c in candidates:
@@ -158,11 +406,25 @@ def _kdir_uses_clang(kdir: Path) -> bool:
     )
 
 
-def verify_kernel_sources(ksrc_dir: Path) -> tuple[bool, str]:
-    """Verify integrity of kernel module sources against pinned kernel_sources.sha256."""
+def verify_kernel_sources(ksrc_dir: Path, require_manifest: bool = False) -> tuple[bool, str]:
+    """Verify integrity of kernel module sources against kernel_sources.sha256 and embedded manifest."""
+    pinned_manifest = _embedded_kernel_sources_sha()
+    try:
+        resolved_ksrc = ksrc_dir.resolve(strict=False)
+        is_bundle_ksrc = resolved_ksrc in {
+            (_bundle_root() / "kernel").resolve(strict=False),
+            (Path(__file__).resolve().parent.parent / "kernel").resolve(strict=False),
+        }
+    except OSError:
+        is_bundle_ksrc = False
+    enforce_pinned = bool(pinned_manifest) and (require_manifest or is_bundle_ksrc)
+
     manifest = ksrc_dir / "kernel_sources.sha256"
-    if not manifest.is_file() or not _is_trusted_artifact(manifest, require_exec=False):
-        return False, "Missing or untrusted kernel_sources.sha256 manifest."
+    if not manifest.is_file():
+        return False, "Missing kernel_sources.sha256 manifest."
+    if not enforce_pinned and not _is_trusted_artifact(manifest, require_exec=False):
+        return False, "Untrusted kernel_sources.sha256 manifest."
+
     expected: dict[str, str] = {}
     for line in _read_text_safe(manifest).splitlines():
         parts = line.strip().split()
@@ -173,7 +435,12 @@ def verify_kernel_sources(ksrc_dir: Path) -> tuple[bool, str]:
         if fname not in expected:
             return False, f"Incomplete kernel_sources.sha256 (missing {fname})."
         fpath = ksrc_dir / fname
-        if not fpath.is_file() or not _is_trusted_artifact(fpath, require_exec=False):
+        pinned_file_sha = pinned_manifest.get(fname) if enforce_pinned else None
+        if enforce_pinned and not pinned_file_sha:
+            return False, f"Embedded manifest missing kernel source hash for {fname}."
+        if pinned_file_sha and not secrets.compare_digest(expected[fname], pinned_file_sha):
+            return False, f"kernel_sources.sha256 mismatch against embedded manifest for {fname}."
+        if not fpath.is_file() or not _is_trusted_artifact(fpath, require_exec=False, pinned_sha256=pinned_file_sha):
             return False, f"Untrusted or missing kernel source file: {fname}"
         try:
             actual = hashlib.sha256(fpath.read_bytes()).hexdigest().lower()
@@ -181,6 +448,8 @@ def verify_kernel_sources(ksrc_dir: Path) -> tuple[bool, str]:
             return False, f"Failed reading {fname}: {exc}"
         if not secrets.compare_digest(expected[fname], actual):
             return False, f"SHA-256 mismatch on kernel source {fname}."
+        if pinned_file_sha and not secrets.compare_digest(pinned_file_sha, actual):
+            return False, f"Embedded SHA-256 mismatch on kernel source {fname}."
     return True, "ok"
 
 
@@ -216,48 +485,61 @@ def ensure_or_build_lkm_for_running_kernel(
     if ksrc_dir is None:
         return {"ok": False, "built": False, "lkm_path": None, "needs_llvm": needs_llvm, "reason": "Kernel C sources not found.", "headers_hint": hint}
 
-    ok_src, src_msg = verify_kernel_sources(ksrc_dir)
+    ok_src, src_msg = verify_kernel_sources(ksrc_dir, require_manifest=True)
     if not ok_src:
         return {"ok": False, "built": False, "lkm_path": None, "needs_llvm": needs_llvm, "reason": src_msg, "headers_hint": hint}
 
-    if not shutil.which("make"):
+    make_bin = _trusted_bin("make")
+    if not make_bin:
         return {"ok": False, "built": False, "lkm_path": None, "needs_llvm": needs_llvm, "reason": "'make' tool missing.", "headers_hint": hint}
-    if needs_llvm and not shutil.which("clang"):
+    if needs_llvm and not _trusted_bin("clang"):
         return {"ok": False, "built": False, "lkm_path": None, "needs_llvm": True, "reason": "Kernel requires Clang/LLVM (LLVM=1) but 'clang' is not installed.", "headers_hint": hint}
-    if not needs_llvm and not (shutil.which("gcc") or shutil.which("cc")):
+    if not needs_llvm and not (_trusted_bin("gcc") or _trusted_bin("cc")):
         return {"ok": False, "built": False, "lkm_path": None, "needs_llvm": False, "reason": "'gcc' compiler missing.", "headers_hint": hint}
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="mc_ss_kbuild_"))
     try:
         os.chmod(tmp_dir, 0o700)
-        for fname in ("mc_ss_kmod.c", "mc_ss_kmod.h", "Makefile"):
+        for fname in ("mc_ss_kmod.c", "mc_ss_kmod.h", "Makefile", "kernel_sources.sha256"):
             shutil.copy2(ksrc_dir / fname, tmp_dir / fname)
-        make_cmd = ["make", "-C", str(kdir), f"M={tmp_dir}"]
+        # Re-verify copied files inside private 0700 build dir to close Kbuild source TOCTOU
+        ok_priv, priv_msg = verify_kernel_sources(tmp_dir, require_manifest=True)
+        if not ok_priv:
+            return {"ok": False, "built": False, "lkm_path": None, "needs_llvm": needs_llvm, "reason": priv_msg, "headers_hint": hint}
+
+        make_cmd = [make_bin, "-C", str(kdir), f"M={tmp_dir}"]
         if needs_llvm:
             make_cmd.append("LLVM=1")
         make_cmd.append("modules")
-        cp = subprocess.run(make_cmd, capture_output=True, text=True, timeout=120, check=False)
+        cp = subprocess.run(make_cmd, capture_output=True, text=True, timeout=120, check=False, env=_clean_priv_env())
         built_ko = tmp_dir / "mc_ss_kmod.ko"
         if cp.returncode != 0 or not built_ko.is_file():
             err = (cp.stderr or cp.stdout or f"make rc={cp.returncode}").strip()
             comp_m = re.search(r"\b(gcc-\d+|clang-\d+|clang)\s*:\s*not found\b", err)
             if comp_m:
                 missing_cc = comp_m.group(1)
-                if profile.pkg_family == "deb":
+                if profile.family == "debian_ubuntu":
                     hint = f"{hint} && sudo apt-get install -y {missing_cc}"
                 else:
                     hint = f"{hint} (eksik derleyici: {missing_cc})"
             return {"ok": False, "built": False, "lkm_path": None, "needs_llvm": needs_llvm, "reason": f"Kbuild compile failed: {err[-400:]}", "headers_hint": hint}
 
-        cache_dir = _invoker_home() / ".local" / "share" / "mc-ss-sentinel" / "kmods" / rel
+        if os.geteuid() == 0:
+            cache_dir = Path("/var/cache/mc-ss-sentinel/kmods") / rel
+        else:
+            cache_dir = _invoker_home() / ".local" / "share" / "mc-ss-sentinel" / "kmods" / rel
         cache_dir.mkdir(parents=True, exist_ok=True)
         dest_ko = cache_dir / "mc_ss_kmod.ko"
-        shutil.copy2(built_ko, dest_ko)
-        os.chmod(dest_ko, 0o644)
-        digest = hashlib.sha256(dest_ko.read_bytes()).hexdigest()
+        tmp_ko = cache_dir / f".mc_ss_kmod.ko.{os.getpid()}.tmp"
+        shutil.copy2(built_ko, tmp_ko)
+        os.chmod(tmp_ko, 0o644)
+        digest = hashlib.sha256(tmp_ko.read_bytes()).hexdigest()
         dest_sha = cache_dir / "mc_ss_kmod.ko.sha256"
-        dest_sha.write_text(f"{digest}\n", encoding="utf-8")
-        os.chmod(dest_sha, 0o644)
+        tmp_sha = cache_dir / f".mc_ss_kmod.ko.sha256.{os.getpid()}.tmp"
+        tmp_sha.write_text(f"{digest}\n", encoding="utf-8")
+        os.chmod(tmp_sha, 0o644)
+        os.replace(tmp_sha, dest_sha)
+        os.replace(tmp_ko, dest_ko)
         return {
             "ok": True,
             "built": True,
@@ -278,11 +560,13 @@ def find_native_probe(root: Path | None = None) -> Path | None:
     candidates = [
         base / "native" / "ss_kernel_probe",
         Path(__file__).resolve().parent.parent / "native" / "ss_kernel_probe",
-        _invoker_home() / ".local" / "share" / "mc-ss-sentinel" / "ss_kernel_probe",
         Path("/usr/local/share/mc-ss-sentinel/ss_kernel_probe"),
     ]
+    if not (os.geteuid() == 0 and _invoker_uid() != 0):
+        candidates.append(_invoker_home() / ".local" / "share" / "mc-ss-sentinel" / "ss_kernel_probe")
+    pinned_sha = (_embedded_probe_sha256() or None) if (os.geteuid() == 0 or root is None) else None
     for c in candidates:
-        if c.is_file() and _is_trusted_artifact(c, require_exec=True):
+        if c.is_file() and _is_trusted_artifact(c, require_exec=True, pinned_sha256=pinned_sha):
             return c
     return None
 
@@ -419,8 +703,8 @@ def check_kernel_prereqs(
         "headers_present": headers_present,
         "needs_llvm": needs_llvm,
         "headers_install_hint": headers_hint,
-        "clang_available": shutil.which("clang") is not None,
-        "gcc_available": shutil.which("gcc") is not None or shutil.which("cc") is not None,
+        "clang_available": _trusted_bin("clang") is not None,
+        "gcc_available": _trusted_bin("gcc") is not None or _trusted_bin("cc") is not None,
         "lockdown_mode": lockdown_mode,
         "modules_disabled": modules_disabled or "unknown",
         "unprivileged_bpf_disabled": unpriv_bpf or "unknown",
@@ -429,28 +713,52 @@ def check_kernel_prereqs(
         "lkm_vermagic": ko_vermagic,
         "lkm_vermagic_match": ko_vermagic_ok,
         "native_probe_path": str(probe_path) if probe_path else None,
-        "pkexec_available": shutil.which("pkexec") is not None,
+        "pkexec_available": _trusted_bin("pkexec") is not None,
         "is_root": os.geteuid() == 0,
     }
 
 
-def _collect_root_extras(probe_bin: Path | None) -> dict[str, Any]:
+def _collect_root_extras(
+    probe_bin: Path | None,
+    stage_dir: Path | None = None,
+    pinned_probe_sha: str | None = None,
+) -> dict[str, Any]:
     """Collect root-level eBPF, ftrace, kprobe, auditd, PCI config, and dmesg telemetry."""
     out: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    priv_env = _clean_priv_env()
 
     if probe_bin and probe_bin.is_file():
-        try:
-            cp = subprocess.run(
-                [str(probe_bin), "all"],
-                capture_output=True,
-                text=True,
-                timeout=12,
-                check=False,
+        exec_probe: Path | None = probe_bin
+        if stage_dir is not None and os.geteuid() == 0:
+            exec_probe = _stage_verified_artifact(
+                probe_bin,
+                stage_dir,
+                require_exec=True,
+                pinned_sha256=pinned_probe_sha,
             )
-            if cp.stdout.strip():
-                out["native_probe"] = json.loads(cp.stdout)
-        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-            out["native_probe_error"] = str(exc)
+            if exec_probe is None:
+                errors["native_probe"] = "Failed trusted staging or SHA-256 verification of ss_kernel_probe."
+        if exec_probe is not None:
+            try:
+                cp = subprocess.run(
+                    [str(exec_probe), "all"],
+                    capture_output=True,
+                    text=True,
+                    timeout=12,
+                    check=False,
+                    env=priv_env,
+                )
+                out["probe_returncode"] = cp.returncode
+                if cp.stderr and cp.stderr.strip():
+                    out["probe_stderr"] = cp.stderr.strip()[-400:]
+                if cp.stdout.strip():
+                    out["native_probe"] = json.loads(cp.stdout)
+                elif cp.returncode != 0:
+                    errors["native_probe"] = f"ss_kernel_probe rc={cp.returncode}: {(cp.stderr or '').strip()}"
+            except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+                out["native_probe_error"] = str(exc)
+                errors["native_probe"] = str(exc)
 
     for key, p in (
         ("kprobes_list", Path("/sys/kernel/debug/kprobes/list")),
@@ -461,36 +769,44 @@ def _collect_root_extras(probe_bin: Path | None) -> dict[str, Any]:
             if p.is_file():
                 lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
                 out[key] = lines[:400]
-        except OSError:
-            pass
+        except OSError as exc:
+            errors[key] = str(exc)
 
-    if shutil.which("dmesg"):
+    dmesg_bin = _trusted_bin("dmesg")
+    if dmesg_bin:
         try:
             cp = subprocess.run(
-                ["dmesg", "-T", "--color=never"],
+                [dmesg_bin, "-T", "--color=never"],
                 capture_output=True,
                 text=True,
                 timeout=6,
                 check=False,
+                env=priv_env,
             )
             if cp.returncode == 0 and cp.stdout:
                 out["dmesg_tail"] = cp.stdout.splitlines()[-500:]
-        except (OSError, subprocess.SubprocessError):
-            pass
+            elif cp.returncode != 0:
+                errors["dmesg"] = (cp.stderr or cp.stdout or f"rc={cp.returncode}").strip()[:200]
+        except (OSError, subprocess.SubprocessError) as exc:
+            errors["dmesg"] = str(exc)
 
-    if shutil.which("ausearch"):
+    ausearch_bin = _trusted_bin("ausearch")
+    if ausearch_bin:
         try:
             cp = subprocess.run(
-                ["ausearch", "-m", "SYSCALL", "-ts", "today", "-i"],
+                [ausearch_bin, "-m", "SYSCALL", "-ts", "today", "-i"],
                 capture_output=True,
                 text=True,
                 timeout=6,
                 check=False,
+                env=priv_env,
             )
             if cp.stdout:
                 out["audit_syscalls_tail"] = cp.stdout.splitlines()[-300:]
-        except (OSError, subprocess.SubprocessError):
-            pass
+            elif cp.returncode not in (0, 1):  # ausearch rc=1 means no matches found
+                errors["ausearch"] = (cp.stderr or f"rc={cp.returncode}").strip()[:200]
+        except (OSError, subprocess.SubprocessError) as exc:
+            errors["ausearch"] = str(exc)
 
     bpf_fs = Path("/sys/fs/bpf")
     if bpf_fs.is_dir():
@@ -501,9 +817,11 @@ def _collect_root_extras(probe_bin: Path | None) -> dict[str, Any]:
                 if len(pinned) >= 300:
                     break
             out["bpf_pinned"] = pinned
-        except OSError:
-            pass
+        except OSError as exc:
+            errors["bpf_fs"] = str(exc)
 
+    if errors:
+        out["errors"] = errors
     return out
 
 
@@ -511,7 +829,8 @@ def _rmmod_cleanly(mod_name: str = "mc_ss_kmod") -> bool:
     """Deterministic rmmod with brief refcount drain retry."""
     if not Path(f"/sys/module/{mod_name}").exists():
         return True
-    rmmod_bin = shutil.which("rmmod") or "/usr/sbin/rmmod"
+    rmmod_bin = _trusted_bin("rmmod") or "/usr/sbin/rmmod"
+    priv_env = _clean_priv_env()
     for _ in range(10):
         try:
             cp = subprocess.run(
@@ -520,6 +839,7 @@ def _rmmod_cleanly(mod_name: str = "mc_ss_kmod") -> bool:
                 text=True,
                 timeout=5,
                 check=False,
+                env=priv_env,
             )
             if cp.returncode == 0 or not Path(f"/sys/module/{mod_name}").exists():
                 return True
@@ -529,62 +849,96 @@ def _rmmod_cleanly(mod_name: str = "mc_ss_kmod") -> bool:
     return not Path(f"/sys/module/{mod_name}").exists()
 
 
+def _acquire_kmod_lock() -> Any:
+    """Acquire exclusive advisory flock protecting concurrent mc_ss_kmod lifecycles."""
+    for lock_path in (Path("/run/mc-ss-sentinel-kmod.lock"), Path("/var/tmp/.mc-ss-sentinel-kmod.lock")):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return fd
+        except OSError:
+            continue
+    return None
+
+
+def _release_kmod_lock(fd: Any) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _write_kmod_state(nonce: str) -> None:
+    state_path = Path("/run/mc-ss-sentinel-kmod.state")
+    try:
+        fd = os.open(str(state_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, json.dumps({"pid": os.getpid(), "nonce": nonce}).encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _clear_kmod_state() -> None:
+    try:
+        Path("/run/mc-ss-sentinel-kmod.state").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _create_exec_stage_dir() -> Path:
+    """Create 0700 stage directory preferring root-owned /var/cache over potential noexec /tmp."""
+    if os.geteuid() == 0:
+        root_cache = Path("/var/cache/mc-ss-sentinel")
+        try:
+            root_cache.mkdir(parents=True, exist_ok=True)
+            os.chmod(root_cache, 0o700)
+            d = Path(tempfile.mkdtemp(prefix="stage_", dir=str(root_cache)))
+            os.chmod(d, 0o700)
+            return d
+        except OSError:
+            pass
+    d = Path(tempfile.mkdtemp(prefix="mc_ss_stage_"))
+    os.chmod(d, 0o700)
+    return d
+
+
 def execute_kernel_snapshot_helper(
     trace_window_ms: int = 1500,
     lkm_override: Path | None = None,
     probe_override: Path | None = None,
     target_os: str = "auto",
+    load_lkm: bool = True,
 ) -> dict[str, Any]:
     """
     Runs with root privileges:
-      1. Cleans up any stale leftover mc_ss_kmod
+      1. Acquires exclusive kmod lifecycle lock & cleans up any stale leftover mc_ss_kmod
       2. Resolves matching mc_ss_kmod.ko or compiles & caches it cleanly on-target
-      3. Loads mc_ss_kmod.ko with ephemeral nonce + trace window
-      4. Collects /proc/mc_ss_sentinel/{status,integrity,tasks_vma,pci_iommu,events}
-      5. Collects native eBPF/kprobe/ftrace/audit/dmesg data
-      6. Guaranteed `finally:` rmmod + unload verification
+      3. Stages verified artifacts into root-owned 0700 stage dir (zero-TOCTOU)
+      4. Loads mc_ss_kmod.ko with ephemeral nonce + trace window (when load_lkm=True)
+      5. Collects /proc/mc_ss_sentinel/{status,integrity,tasks_vma,pci_iommu,events}
+      6. Collects native eBPF/kprobe/ftrace/audit/dmesg data
+      7. Guaranteed `finally:` rmmod + unload verification + staging cleanup
     """
     if os.geteuid() != 0:
         return {"ok": False, "error": "Helper requires root privileges (euid != 0)."}
 
-    prereqs = check_kernel_prereqs(target_os=target_os)
-    ko_path = lkm_override if lkm_override is not None else find_lkm_object()
-    probe_path = probe_override if probe_override is not None else find_native_probe()
-    if ko_path is not None and not _is_trusted_artifact(ko_path, require_exec=False):
-        ko_path = None
-    if probe_path is not None and not _is_trusted_artifact(probe_path, require_exec=True):
-        probe_path = None
-
-    build_attempt: dict[str, Any] | None = None
-    if lkm_override is None and prereqs["modules_disabled"] != "1" and (ko_path is None or not prereqs["lkm_vermagic_match"]):
-        build_attempt = ensure_or_build_lkm_for_running_kernel(target_os=target_os)
-        if build_attempt.get("ok") and build_attempt.get("lkm_path"):
-            cand = Path(build_attempt["lkm_path"])
-            if _is_trusted_artifact(cand, require_exec=False):
-                ko_path = cand
-                prereqs["lkm_path"] = str(cand)
-                prereqs["lkm_vermagic"] = build_attempt.get("vermagic") or _modinfo_vermagic(cand)
-                prereqs["lkm_vermagic_match"] = _vermagic_matches(prereqs["lkm_vermagic"], prereqs["kernel_release"])
-
-    result: dict[str, Any] = {
-        "ok": True,
-        "prereqs": prereqs,
-        "lkm_attempted": False,
-        "lkm_loaded": False,
-        "lkm_unloaded_cleanly": True,
-        "lkm_error": "",
-        "lkm_build_attempt": build_attempt,
-        "session_nonce": "",
-        "proc_snapshots": {},
-        "root_extras": {},
-    }
-
-    # Pre-clean any stray module from previous interrupted session
-    _rmmod_cleanly("mc_ss_kmod")
+    pinned_probe_sha: str | None = (_embedded_probe_sha256() or None) if probe_override is None else None
+    lock_fd = _acquire_kmod_lock()
+    stage_dir = _create_exec_stage_dir()
 
     # Handle termination signals so driver still unloads cleanly on cancel
     def _on_sig(_signum: int, _frame: Any) -> None:
         _rmmod_cleanly("mc_ss_kmod")
+        _clear_kmod_state()
         raise KeyboardInterrupt("Kernel helper interrupted")
 
     is_main_thread = threading.current_thread() is threading.main_thread()
@@ -594,29 +948,78 @@ def execute_kernel_snapshot_helper(
         prev_int = signal.signal(signal.SIGINT, _on_sig)
         prev_term = signal.signal(signal.SIGTERM, _on_sig)
 
+    priv_env = _clean_priv_env()
+
     try:
+        # Pre-clean any stray module from previous interrupted session (safe now under lock)
+        if load_lkm:
+            _rmmod_cleanly("mc_ss_kmod")
+            _clear_kmod_state()
+
+        prereqs = check_kernel_prereqs(target_os=target_os)
+        ko_path = (lkm_override if lkm_override is not None else find_lkm_object()) if load_lkm else None
+        probe_path = probe_override if probe_override is not None else find_native_probe()
+        if ko_path is not None and not _is_trusted_artifact(ko_path, require_exec=False):
+            ko_path = None
+        if probe_path is not None and not _is_trusted_artifact(
+            probe_path, require_exec=True, pinned_sha256=pinned_probe_sha
+        ):
+            probe_path = None
+
+        build_attempt: dict[str, Any] | None = None
+        if (
+            load_lkm
+            and lkm_override is None
+            and prereqs["modules_disabled"] != "1"
+            and (ko_path is None or not prereqs["lkm_vermagic_match"])
+        ):
+            build_attempt = ensure_or_build_lkm_for_running_kernel(target_os=target_os)
+            if build_attempt.get("ok") and build_attempt.get("lkm_path"):
+                cand = Path(build_attempt["lkm_path"])
+                if _is_trusted_artifact(cand, require_exec=False):
+                    ko_path = cand
+                    prereqs["lkm_path"] = str(cand)
+                    prereqs["lkm_vermagic"] = build_attempt.get("vermagic") or _modinfo_vermagic(cand)
+                    prereqs["lkm_vermagic_match"] = _vermagic_matches(prereqs["lkm_vermagic"], prereqs["kernel_release"])
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "prereqs": prereqs,
+            "lkm_attempted": False,
+            "lkm_loaded": False,
+            "lkm_unloaded_cleanly": True,
+            "lkm_error": "",
+            "cleanup_error": "",
+            "lkm_build_attempt": build_attempt,
+            "session_nonce": "",
+            "proc_snapshots": {},
+            "root_extras": {},
+        }
+
         # Always collect root-level eBPF / audit / kprobe / PCI even if .ko cannot load
-        result["root_extras"] = _collect_root_extras(probe_path)
+        result["root_extras"] = _collect_root_extras(
+            probe_path,
+            stage_dir=stage_dir,
+            pinned_probe_sha=pinned_probe_sha,
+        )
+
+        if not load_lkm:
+            return result
 
         if ko_path and ko_path.is_file():
             result["lkm_attempted"] = True
-            ko_vermagic = prereqs["lkm_vermagic"]
-            ko_vermagic_ok = prereqs["lkm_vermagic_match"]
-            if lkm_override is not None and shutil.which("modinfo"):
-                try:
-                    cp_mi = subprocess.run(
-                        ["modinfo", "-F", "vermagic", str(ko_path)],
-                        capture_output=True,
-                        text=True,
-                        timeout=3,
-                        check=False,
-                    )
-                    ko_vermagic = (cp_mi.stdout or "").strip()
-                    rel_k = prereqs["kernel_release"]
-                    ko_vermagic_ok = ko_vermagic.startswith(rel_k + " ") or ko_vermagic == rel_k
-                except OSError:
-                    ko_vermagic_ok = False
-            if prereqs["modules_disabled"] == "1":
+            staged_ko = _stage_verified_artifact(ko_path, stage_dir, require_exec=False)
+            if staged_ko is None:
+                result["lkm_error"] = "mc_ss_kmod.ko guvenli dogrulama veya SHA-256 kontrolunu gecemedi."
+                ko_vermagic = ""
+                ko_vermagic_ok = False
+            else:
+                ko_vermagic = _modinfo_vermagic(staged_ko) or prereqs["lkm_vermagic"]
+                rel_k = prereqs["kernel_release"]
+                ko_vermagic_ok = _vermagic_matches(ko_vermagic, rel_k)
+            if staged_ko is None:
+                pass
+            elif prereqs["modules_disabled"] == "1":
                 result["lkm_error"] = "kernel.modules_disabled=1 (modül yükleme kilitli)."
             elif not ko_vermagic_ok:
                 result["lkm_error"] = (
@@ -626,13 +1029,14 @@ def execute_kernel_snapshot_helper(
             else:
                 nonce = secrets.token_hex(8)
                 result["session_nonce"] = nonce
-                insmod_bin = shutil.which("insmod") or "/usr/sbin/insmod"
-                clamped_ms = max(100, min(5000, int(trace_window_ms)))
+                insmod_bin = _trusted_bin("insmod") or "/usr/sbin/insmod"
+                clamped_ms = max(100, min(15000, int(trace_window_ms)))
                 try:
+                    _write_kmod_state(nonce)
                     cp = subprocess.run(
                         [
                             insmod_bin,
-                            str(ko_path),
+                            str(staged_ko),
                             f"session_nonce={nonce}",
                             "enable_live_probes=1",
                         ],
@@ -640,6 +1044,7 @@ def execute_kernel_snapshot_helper(
                         text=True,
                         timeout=8,
                         check=False,
+                        env=priv_env,
                     )
                     if cp.returncode != 0:
                         result["lkm_error"] = (cp.stderr or cp.stdout or f"insmod rc={cp.returncode}").strip()
@@ -672,7 +1077,11 @@ def execute_kernel_snapshot_helper(
                 finally:
                     unloaded = _rmmod_cleanly("mc_ss_kmod")
                     result["lkm_unloaded_cleanly"] = unloaded
-                    if not unloaded:
+                    if unloaded:
+                        _clear_kmod_state()
+                    else:
+                        result["ok"] = False
+                        result["cleanup_error"] = "rmmod verification failed"
                         result["lkm_error"] = (result["lkm_error"] + " | rmmod verification failed").strip(" |")
         else:
             hint = ""
@@ -685,6 +1094,8 @@ def execute_kernel_snapshot_helper(
         if is_main_thread:
             signal.signal(signal.SIGINT, prev_int)
             signal.signal(signal.SIGTERM, prev_term)
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        _release_kmod_lock(lock_fd)
 
     return result
 
@@ -693,22 +1104,28 @@ def collect_privileged_kernel_snapshot(
     trace_window_ms: int = 1500,
     allow_pkexec: bool = True,
     target_os: str = "auto",
+    load_lkm: bool = True,
 ) -> dict[str, Any]:
     """
     Acquire full Ring-0 + eBPF + root forensic snapshot from either current root context
     or a single sanctioned pkexec elevation invocation. Always cleans up kernel driver on return.
     """
     if os.geteuid() == 0:
-        return execute_kernel_snapshot_helper(trace_window_ms=trace_window_ms, target_os=target_os)
+        return execute_kernel_snapshot_helper(
+            trace_window_ms=trace_window_ms,
+            target_os=target_os,
+            load_lkm=load_lkm,
+        )
 
     if not allow_pkexec:
         return {"ok": False, "declined": True, "error": "Elevated Ring-0 scan disabled by caller."}
 
-    pkexec_bin = shutil.which("pkexec")
+    pkexec_bin = _trusted_bin("pkexec")
     if not pkexec_bin:
         return {"ok": False, "declined": True, "error": "pkexec bulunamadi; root yetkisi alinamadi."}
 
-    clamped_ms = max(100, min(5000, int(trace_window_ms)))
+    clamped_ms = max(100, min(15000, int(trace_window_ms)))
+    timeout_s = max(60, int(clamped_ms / 1000.0) + 60)
     if getattr(sys, "frozen", False):
         cmd = [pkexec_bin, sys.executable, "--kernel-snapshot-helper", "--trace-ms", str(clamped_ms)]
     else:
@@ -729,23 +1146,28 @@ def collect_privileged_kernel_snapshot(
             cmd,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout_s,
             check=False,
+            env=_clean_priv_env(preserve_display=True),
         )
-        if cp.returncode == 126 or cp.returncode == 127:
+        if cp.returncode in (126, 127):
             return {
                 "ok": False,
                 "declined": True,
                 "error": f"Kullanici Polkit (pkexec) yetki onayini iptal etti (rc={cp.returncode}).",
             }
+        if cp.stdout.strip():
+            try:
+                data = json.loads(cp.stdout)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
         if cp.returncode != 0:
             err_txt = (cp.stderr or "").strip() or f"pkexec helper rc={cp.returncode}"
-            return {"ok": False, "declined": True, "error": err_txt}
-        data = json.loads(cp.stdout)
-        if isinstance(data, dict):
-            return data
+            return {"ok": False, "declined": False, "error": err_txt}
         return {"ok": False, "error": "Gecersiz helper JSON ciktisi."}
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "error": f"Yetkili helper hatasi: {exc}"}
 
 
@@ -833,7 +1255,7 @@ def detect_bootloader_strategy(
             "reason": "SteamOS 3 uses an immutable Valve A/B rootfs; verify VT-d / AMD-Vi / IOMMU in UEFI Setup instead of modifying A/B GRUB.",
         }
     if (root_prefix / "usr/bin/kernelstub").exists() or (
-        root_prefix == Path("/") and shutil.which("kernelstub") is not None and host.os_id == "pop"
+        root_prefix == Path("/") and _trusted_bin("kernelstub") is not None and host.os_id == "pop"
     ):
         return "kernelstub", {"profile": profile.target_id, "can_auto_apply": True}
 
@@ -1016,7 +1438,32 @@ def _write_with_backup(path: Path, new_content: str) -> None:
         if not backup.exists():
             shutil.copy2(path, backup)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new_content, encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        os.write(fd, new_content.encode("utf-8"))
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        if path.exists():
+            try:
+                shutil.copymode(path, tmp_path)
+            except OSError:
+                os.chmod(tmp_path, 0o644)
+        else:
+            os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def execute_iommu_hardening_as_root(
@@ -1043,14 +1490,16 @@ def execute_iommu_hardening_as_root(
     args: list[str] = plan.get("recommended_args", [])
     bad_flags: list[str] = plan.get("remove_args", [])
     meta: dict[str, Any] = plan.get("bootloader_meta", {})
+    priv_env = _clean_priv_env()
 
     try:
         if strategy in {"rpm_ostree", "grubby", "kernelstub"}:
             outputs: list[str] = []
             for cmd in plan["commands"]:
-                if shutil.which(cmd[0]) is None:
+                exe = _trusted_bin(cmd[0])
+                if exe is None:
                     return {"ok": False, "changed": False, "message": f"Komut bulunamadi: {cmd[0]}"}
-                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
+                cp = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True, timeout=180, check=False, env=priv_env)
                 if cp.returncode != 0:
                     return {
                         "ok": False,
@@ -1066,27 +1515,55 @@ def execute_iommu_hardening_as_root(
                 "stdout": "\n".join(outputs),
             }
 
+        def _rollback_text(target: Path, original: str, existed: bool) -> None:
+            try:
+                if existed:
+                    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.rb.", dir=str(target.parent))
+                    tp = Path(tmp_name)
+                    try:
+                        os.write(fd, original.encode("utf-8"))
+                        os.fsync(fd)
+                        os.close(fd)
+                        fd = -1
+                        if target.exists():
+                            shutil.copymode(target, tp)
+                        os.replace(tp, target)
+                    finally:
+                        if fd >= 0:
+                            os.close(fd)
+                        if tp.exists():
+                            tp.unlink(missing_ok=True)
+                elif target.exists():
+                    target.unlink()
+            except OSError:
+                pass
+
         if strategy in {"grub_update", "grub_mkconfig"}:
             grub_default = Path(meta.get("grub_default") or (root_prefix / "etc/default/grub"))
+            existed = grub_default.exists()
             old_txt = _read_text_safe(grub_default)
             new_txt = update_grub_default_content(old_txt, args, bad_flags)
             _write_with_backup(grub_default, new_txt)
             if root_prefix != Path("/"):
                 return {"ok": True, "changed": True, "message": f"Dry-root GRUB guncellendi: {grub_default}"}
             if strategy == "grub_update":
-                upd = shutil.which("update-grub") or shutil.which("update-grub2")
+                upd = _trusted_bin("update-grub") or _trusted_bin("update-grub2")
+                mkcfg = _trusted_bin("grub-mkconfig") or _trusted_bin("grub2-mkconfig")
                 if upd:
-                    cp = subprocess.run([upd], capture_output=True, text=True, timeout=120, check=False)
-                elif shutil.which("grub-mkconfig"):
-                    cp = subprocess.run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"], capture_output=True, text=True, timeout=120, check=False)
+                    cp = subprocess.run([upd], capture_output=True, text=True, timeout=120, check=False, env=priv_env)
+                elif mkcfg:
+                    cp = subprocess.run([mkcfg, "-o", "/boot/grub/grub.cfg"], capture_output=True, text=True, timeout=120, check=False, env=priv_env)
                 else:
+                    _rollback_text(grub_default, old_txt, existed)
                     return {"ok": False, "changed": False, "message": "update-grub / grub-mkconfig bulunamadi."}
             else:
-                mkcfg = shutil.which("grub-mkconfig") or shutil.which("grub2-mkconfig")
+                mkcfg = _trusted_bin("grub-mkconfig") or _trusted_bin("grub2-mkconfig")
                 if not mkcfg:
+                    _rollback_text(grub_default, old_txt, existed)
                     return {"ok": False, "changed": False, "message": "grub-mkconfig bulunamadi."}
-                cp = subprocess.run([mkcfg, "-o", meta.get("grub_cfg", "/boot/grub/grub.cfg")], capture_output=True, text=True, timeout=120, check=False)
+                cp = subprocess.run([mkcfg, "-o", meta.get("grub_cfg", "/boot/grub/grub.cfg")], capture_output=True, text=True, timeout=120, check=False, env=priv_env)
             if cp.returncode != 0:
+                _rollback_text(grub_default, old_txt, existed)
                 return {"ok": False, "changed": False, "message": (cp.stderr or cp.stdout or f"rc={cp.returncode}").strip()}
             return {
                 "ok": True,
@@ -1098,10 +1575,14 @@ def execute_iommu_hardening_as_root(
         if strategy == "systemd_boot":
             if meta.get("sdboot_manage"):
                 cfg = Path(meta["sdboot_manage"])
-                _write_with_backup(cfg, update_sdboot_manage_content(_read_text_safe(cfg), args, bad_flags))
-                if root_prefix == Path("/") and shutil.which("sdboot-manage"):
-                    cp = subprocess.run(["sdboot-manage", "update"], capture_output=True, text=True, timeout=120, check=False)
+                existed = cfg.exists()
+                old_sd = _read_text_safe(cfg)
+                _write_with_backup(cfg, update_sdboot_manage_content(old_sd, args, bad_flags))
+                sd_bin = _trusted_bin("sdboot-manage")
+                if root_prefix == Path("/") and sd_bin:
+                    cp = subprocess.run([sd_bin, "update"], capture_output=True, text=True, timeout=120, check=False, env=priv_env)
                     if cp.returncode != 0:
+                        _rollback_text(cfg, old_sd, existed)
                         return {"ok": False, "changed": False, "message": (cp.stderr or cp.stdout or f"sdboot-manage rc={cp.returncode}").strip()}
             for ent_str in meta.get("entries", []):
                 ent = Path(ent_str)
@@ -1117,10 +1598,14 @@ def execute_iommu_hardening_as_root(
             if not cfg_str:
                 return {"ok": False, "changed": False, "message": "Limine varsayilan konfigurasyonu (/etc/default/limine) bulunamadi; manuel ekleyin."}
             cfg = Path(cfg_str)
-            _write_with_backup(cfg, update_limine_default_content(_read_text_safe(cfg), args, bad_flags))
-            if root_prefix == Path("/") and shutil.which("limine-update"):
-                cp = subprocess.run(["limine-update"], capture_output=True, text=True, timeout=120, check=False)
+            existed = cfg.exists()
+            old_lim = _read_text_safe(cfg)
+            _write_with_backup(cfg, update_limine_default_content(old_lim, args, bad_flags))
+            lim_bin = _trusted_bin("limine-update")
+            if root_prefix == Path("/") and lim_bin:
+                cp = subprocess.run([lim_bin], capture_output=True, text=True, timeout=120, check=False, env=priv_env)
                 if cp.returncode != 0:
+                    _rollback_text(cfg, old_lim, existed)
                     return {"ok": False, "changed": False, "message": (cp.stderr or cp.stdout or f"limine-update rc={cp.returncode}").strip()}
             return {
                 "ok": True,
@@ -1144,16 +1629,17 @@ def apply_iommu_hardening(target_os: str = "auto") -> dict[str, Any]:
     if os.geteuid() == 0:
         return execute_iommu_hardening_as_root(target_os=target_os)
 
-    pkexec_bin = shutil.which("pkexec")
+    pkexec_bin = _trusted_bin("pkexec")
     if not pkexec_bin:
         return {"ok": False, "changed": False, "message": "Komut bulunamadi: pkexec"}
 
     strategy = plan["bootloader"]
     if strategy in {"rpm_ostree", "grubby"}:
         cmd = plan["commands"][0]
-        if shutil.which(cmd[0]) is None:
+        exe = _trusted_bin(cmd[0])
+        if exe is None:
             return {"ok": False, "changed": False, "message": f"Komut bulunamadi: {cmd[0]}"}
-        exec_cmd = [pkexec_bin] + cmd
+        exec_cmd = [pkexec_bin, exe, *cmd[1:]]
     else:
         if getattr(sys, "frozen", False):
             exec_cmd = [pkexec_bin, sys.executable, "--apply-iommu-helper", "--target-os", plan["target_os"]]
@@ -1162,7 +1648,7 @@ def apply_iommu_hardening(target_os: str = "auto") -> dict[str, Any]:
             exec_cmd = [pkexec_bin, sys.executable, str(entry), "--apply-iommu-helper", "--target-os", plan["target_os"]]
 
     try:
-        cp = subprocess.run(exec_cmd, capture_output=True, text=True, timeout=180, check=False)
+        cp = subprocess.run(exec_cmd, capture_output=True, text=True, timeout=180, check=False, env=_clean_priv_env(preserve_display=True))
         if strategy not in {"rpm_ostree", "grubby"} and cp.stdout.strip():
             try:
                 parsed = json.loads(cp.stdout)

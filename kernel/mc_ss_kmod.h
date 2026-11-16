@@ -13,6 +13,7 @@
 #define SS_PROC_DIR            "mc_ss_sentinel"
 
 #define SS_EVENT_RING_CAP      1024U
+#define SS_INFLIGHT_CAP        128U
 #define SS_MAX_TASK_SNAP       2048U
 #define SS_MAX_VMA_CAND        192U
 #define SS_MAX_MOD_SNAP        512U
@@ -41,6 +42,7 @@ enum ss_event_type {
 
 struct ss_kprobe_event {
 	u64 ts_ns;
+	u64 start_ns;
 	u32 type;
 	pid_t pid;
 	pid_t tgid;
@@ -48,6 +50,8 @@ struct ss_kprobe_event {
 	char comm[TASK_COMM_LEN];
 	unsigned long arg0;
 	unsigned long arg1;
+	long ret;
+	u8 has_ret;
 	char detail[SS_EVENT_DETAIL_LEN];
 };
 

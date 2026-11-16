@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import stat
 from pathlib import Path
 
 from .distro_profiles import resolve_profile
-from .models import Confidence, Finding, ScanContext, Severity
+from .models import Confidence, Finding, ScanContext, ScanStatus, Severity
 from .signatures import ANTI_FORENSIC_CMD_RE
 from .utils import (
     emit_scan_progress,
@@ -17,6 +18,7 @@ from .utils import (
     record_scan_region,
     run_trusted_cmd,
     safe_read_bytes,
+    safe_read_tail_text,
     safe_read_text,
     statx_timestamps,
 )
@@ -342,7 +344,7 @@ def _check_shell_histories(ctx: ScanContext) -> None:
                 )
             )
 
-        content = safe_read_text(hf, max_bytes=2 * 1024 * 1024)
+        content = safe_read_tail_text(hf, max_bytes=2 * 1024 * 1024)
         af_hits: list[str] = []
         cheat_hits: list[str] = []
         for idx, line in enumerate(content.splitlines(), 1):
@@ -740,7 +742,7 @@ def _check_package_logs_and_aur(ctx: ScanContext) -> None:
     # Check Pacman recent package events (ISO timestamp at start: [2026-11-15T18:00:00+0300])
     pac_log = ctx.root_prefix / "var/log/pacman.log"
     if pac_log.is_file():
-        pac_txt = safe_read_text(pac_log, max_bytes=262144)
+        pac_txt = safe_read_tail_text(pac_log, max_bytes=262144)
         for line in pac_txt.splitlines()[-400:]:
             low = line.lower()
             if "[alpm] installed " not in low and "[alpm] upgraded " not in low:
@@ -752,7 +754,7 @@ def _check_package_logs_and_aur(ctx: ScanContext) -> None:
     # Check APT recent history
     apt_log = ctx.root_prefix / "var/log/apt/history.log"
     if apt_log.is_file():
-        apt_txt = safe_read_text(apt_log, max_bytes=262144)
+        apt_txt = safe_read_tail_text(apt_log, max_bytes=262144)
         for line in apt_txt.splitlines()[-300:]:
             low = line.lower()
             if not low.startswith(("install:", "commandline:")):
@@ -840,7 +842,8 @@ def _check_live_journal_and_coredump(ctx: ScanContext) -> None:
             )
 
     # Recent sudo commands in journalctl
-    hours = max(1, int(round(ctx.time_window_hours)))
+    win_h = ctx.time_window_hours if (math.isfinite(ctx.time_window_hours) and ctx.time_window_hours > 0) else 48.0
+    hours = max(1, int(round(win_h)))
     rc2, jout, _ = run_trusted_cmd(
         ["journalctl", "_COMM=sudo", "--since", f"{hours} hours ago", "--no-pager", "-n", "60"],
         timeout=4.0,
@@ -890,6 +893,14 @@ def run(ctx: ScanContext) -> None:
         _check_path_shadowing(ctx)
         _check_live_journal_and_coredump(ctx)
         record_scan_region(ctx, "E1", "$PATH komut golgeleme, journalctl, coredumpctl")
+        ctx.set_coverage(
+            "E1.system",
+            ScanStatus.COMPLETED if ctx.live_mode else ScanStatus.PARTIAL,
+            "System/shell/MAC checks completed" if ctx.live_mode else "Offline mode (live journal/timedatectl skipped)",
+        )
         emit_scan_progress(ctx, 1.0, "Sistem butunluk analizi tamamlandi.")
     except Exception as exc:
+        if exc.__class__.__name__ == "ScanCancelledError":
+            raise
+        ctx.set_coverage("E1.system", ScanStatus.ERROR, str(exc))
         ctx.add_error(ENGINE_NAME, f"Beklenmeyen hata: {exc}")

@@ -614,6 +614,7 @@ class ScanWorker(QThread):
 
     progress_changed = Signal(int, str)
     scan_completed = Signal(str, dict)
+    scan_cancelled = Signal(str)
     scan_failed = Signal(str)
 
     def __init__(
@@ -629,6 +630,14 @@ class ScanWorker(QThread):
         self._desktop_dir = desktop_dir
         self._enable_kernel_lkm = enable_kernel_lkm
         self._target_os = target_os
+        self._ctx: ScanContext | None = None
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+        ctx = self._ctx
+        if ctx is not None:
+            ctx.request_cancel()
 
     def run(self) -> None:
         try:
@@ -640,19 +649,29 @@ class ScanWorker(QThread):
                 target_os=self._target_os,
                 deep_home_scan=True,
             )
+            self._ctx = ctx
+            if self._cancel_requested:
+                ctx.request_cancel()
 
             def _on_pct(pct: int, msg: str) -> None:
                 self.progress_changed.emit(max(0, min(98, pct)), msg)
 
             orchestrator.run_all_engines(ctx, progress_pct_cb=_on_pct)
+            if ctx.is_cancelled():
+                raise orchestrator.ScanCancelledError("Tarama kullanici tarafindan iptal edildi.")
             self.progress_changed.emit(99, "Detayli rapor Masaustune yaziliyor...")
             txt_path, payload = engine8_reporter.write_desktop_txt_report(
                 ctx, desktop_dir=self._desktop_dir
             )
             self.progress_changed.emit(100, "Tarama tamamlandi.")
             self.scan_completed.emit(str(txt_path), payload)
+        except orchestrator.ScanCancelledError as exc:
+            self.progress_changed.emit(0, "Tarama iptal edildi.")
+            self.scan_cancelled.emit(str(exc))
         except Exception as exc:
             self.scan_failed.emit(str(exc))
+        finally:
+            self._ctx = None
 
 
 class IommuApplyWorker(QThread):
@@ -852,14 +871,45 @@ class SentinelMainWindow(QMainWindow):
         opts_row.addWidget(self.iommu_button)
         root_layout.addWidget(opts_card)
 
-        # Refined primary 'Tara' CTA button
+        # Refined primary 'Tara' CTA button + cooperative Cancel button while running
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
         self.scan_button = QPushButton("Tara", central)
         self.scan_button.setMinimumHeight(46)
         self.scan_button.setFont(_make_ui_font(11.5, QFont.Weight.DemiBold))
         self.scan_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scan_button.setStyleSheet(_PRIMARY_BTN_QSS)
         self.scan_button.clicked.connect(self.start_scan)
-        root_layout.addWidget(self.scan_button)
+        action_row.addWidget(self.scan_button, 1)
+
+        self.cancel_button = QPushButton("İptal", central)
+        self.cancel_button.setMinimumHeight(46)
+        self.cancel_button.setFixedWidth(96)
+        self.cancel_button.setFont(_make_ui_font(10.0, QFont.Weight.DemiBold))
+        self.cancel_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #1f1215;
+                color: #fca5a5;
+                border: 1px solid #7f1d1d;
+                border-radius: 10px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #31171c;
+                border-color: #ef4444;
+            }
+            QPushButton:disabled {
+                color: #64748b;
+                border-color: #1e293b;
+            }
+            """
+        )
+        self.cancel_button.clicked.connect(self.cancel_scan)
+        self.cancel_button.setVisible(False)
+        action_row.addWidget(self.cancel_button)
+        root_layout.addLayout(action_row)
 
         # Balanced centered status card
         self.status_frame = QFrame(central)
@@ -953,6 +1003,8 @@ class SentinelMainWindow(QMainWindow):
         self.kernel_lkm_checkbox.setEnabled(False)
         self.change_os_button.setEnabled(False)
         self.scan_button.setText("Taranıyor...")
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setVisible(True)
         self.progress_bar.setValue(0)
         self.status_label.setFont(_make_ui_font(10.0))
         self.status_label.setStyleSheet(
@@ -969,8 +1021,15 @@ class SentinelMainWindow(QMainWindow):
         )
         self._worker.progress_changed.connect(self._on_progress)
         self._worker.scan_completed.connect(self._on_completed)
+        self._worker.scan_cancelled.connect(self._on_cancelled)
         self._worker.scan_failed.connect(self._on_failed)
         self._worker.start()
+
+    def cancel_scan(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("Tarama iptal ediliyor...")
+            self._worker.request_cancel()
 
     def show_iommu_dialog(self) -> None:
         plan = priv_helper.build_iommu_hardening_plan(target_os=self._target_os)
@@ -1025,35 +1084,45 @@ class SentinelMainWindow(QMainWindow):
         QMessageBox.information(self, "IOMMU Sertleştirme", res.get("message", ""))
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        for th in (self._worker, self._iommu_worker):
-            if th is not None and th.isRunning():
-                th.wait(1500)
-                if th.isRunning():
-                    th.terminate()
-                    th.wait(500)
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.request_cancel()
+            self._worker.wait(5000)
+        if self._iommu_worker is not None and self._iommu_worker.isRunning():
+            self._iommu_worker.wait(5000)
         super().closeEvent(event)
 
     def _on_progress(self, pct: int, msg: str) -> None:
         self.progress_bar.setValue(pct)
         self.status_label.setText(f"[%{pct}] {msg}")
 
-    def _on_completed(self, _txt_path: str, _payload: dict[str, Any]) -> None:
-        self.progress_bar.setValue(100)
+    def _reset_scan_controls(self) -> None:
         self.scan_button.setEnabled(True)
         self.kernel_lkm_checkbox.setEnabled(True)
         self.change_os_button.setEnabled(True)
         self.scan_button.setText("Tara")
+        self.cancel_button.setVisible(False)
+        self.cancel_button.setEnabled(False)
+
+    def _on_completed(self, _txt_path: str, _payload: dict[str, Any]) -> None:
+        self.progress_bar.setValue(100)
+        self._reset_scan_controls()
         self.status_label.setStyleSheet(
             "color: #4ade80; border: none; background: transparent;"
         )
         self.status_label.setFont(_make_ui_font(10.0, QFont.Weight.DemiBold))
         self.status_label.setText("Tarama tamamlandı. Rapor masaüstüne kaydedildi.")
 
+    def _on_cancelled(self, _reason: str) -> None:
+        self.progress_bar.setValue(0)
+        self._reset_scan_controls()
+        self.status_label.setFont(_make_ui_font(10.0))
+        self.status_label.setStyleSheet(
+            "color: #fbbf24; border: none; background: transparent;"
+        )
+        self.status_label.setText("Tarama iptal edildi.")
+
     def _on_failed(self, err: str) -> None:
-        self.scan_button.setEnabled(True)
-        self.kernel_lkm_checkbox.setEnabled(True)
-        self.change_os_button.setEnabled(True)
-        self.scan_button.setText("Tara")
+        self._reset_scan_controls()
         self.status_label.setFont(_make_ui_font(10.0))
         self.status_label.setStyleSheet(
             "color: #f87171; border: none; background: transparent;"
@@ -1134,9 +1203,11 @@ def main() -> int:
 
     prereqs = priv_helper.check_kernel_prereqs(target_os=selected_os)
     lkm_available = bool(
-        priv_helper.find_lkm_object() is not None
-        or prereqs.get("lkm_vermagic_match")
-        or prereqs.get("headers_present")
+        prereqs.get("lkm_vermagic_match")
+        or (
+            prereqs.get("headers_present")
+            and (prereqs.get("gcc_available") or prereqs.get("clang_available"))
+        )
     )
     win = SentinelMainWindow(
         enable_kernel_lkm_default=lkm_available,
