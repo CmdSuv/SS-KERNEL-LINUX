@@ -1,0 +1,60 @@
+{
+  "targets": {
+    "bazzite": {
+      "display_name": "Bazzite / Fedora Atomic",
+      "dockerfile": "packaging/dockerfiles/Dockerfile.bazzite",
+      "image_tag": "mc-ss-sentinel-builder:bazzite",
+      "base_image": "registry.fedoraproject.org/fedora:43",
+      "glibc_floor": "2.42",
+      "notes": "Dedicated Bazzite/Fedora Atomic target build -> targets/bazzite/ (leaves dev dist/ & Desktop ELF untouched)."
+    },
+    "fedora_nobara": {
+      "display_name": "Fedora Workstation & Nobara (43/44/45)",
+      "dockerfile": "packaging/dockerfiles/Dockerfile.fedora_nobara",
+      "image_tag": "mc-ss-sentinel-builder:fedora_nobara",
+      "base_image": "registry.fedoraproject.org/fedora:43",
+      "glibc_floor": "2.42",
+      "notes": "Compiles on Fedora 43 floor for seamless compatibility on Fedora 43-45 & Nobara + dnf/grubby + kernel-devel."
+    },
+    "ubuntu_24_04": {
+      "display_name": "Ubuntu 24.04 LTS / Mint 22 / Pop!_OS 24.04",
+      "dockerfile": "packaging/dockerfiles/Dockerfile.ubuntu_24_04",
+      "image_tag": "mc-ss-sentinel-builder:ubuntu_24_04",
+      "base_image": "docker.io/library/ubuntu:24.04",
+      "glibc_floor": "2.39",
+      "notes": "Compiles native probe & Qt6 bundle against glibc 2.39 & Linux 6.8 UAPI; includes Snap/GRUB/kernelstub/AppArmor support."
+    },
+    "ubuntu_22_04": {
+      "display_name": "Ubuntu 22.04 LTS / Mint 21 / Pop!_OS 22.04",
+      "dockerfile": "packaging/dockerfiles/Dockerfile.ubuntu_22_04",
+      "image_tag": "mc-ss-sentinel-builder:ubuntu_22_04",
+      "base_image": "docker.io/library/ubuntu:22.04",
+      "glibc_floor": "2.35",
+      "notes": "Uses PySide6 6.7.3 + glibc 2.35 + Linux 5.15 UAPI headers so binary runs natively on both 5.15 GA & 6.8 HWE kernels."
+    },
+    "debian": {
+      "display_name": "Debian 12 (Bookworm) / Debian 13 (Trixie) / MX Linux",
+      "dockerfile": "packaging/dockerfiles/Dockerfile.debian",
+      "image_tag": "mc-ss-sentinel-builder:debian",
+      "base_image": "docker.io/library/debian:bookworm",
+      "glibc_floor": "2.36",
+      "notes": "Compiled against Debian 12 Bookworm glibc 2.36 & Linux 6.1 UAPI so the ELF runs on both Bookworm and Trixie."
+    },
+    "arch_cachyos": {
+      "display_name": "Arch Linux / CachyOS / EndeavourOS / Garuda",
+      "dockerfile": "packaging/dockerfiles/Dockerfile.arch_cachyos",
+      "image_tag": "mc-ss-sentinel-builder:arch_cachyos",
+      "base_image": "docker.io/library/archlinux:latest",
+      "glibc_floor": "2.40+",
+      "notes": "Includes GCC & Clang/LLVM=1 detection, dynamic CachyOS/zen/lts kernel header mapping, AUR & systemd-boot/GRUB/Limine."
+    },
+    "steamos": {
+      "display_name": "SteamOS 3 (Steam Deck / Valve Holo)",
+      "dockerfile": "packaging/dockerfiles/Dockerfile.steamos",
+      "image_tag": "mc-ss-sentinel-builder:steamos",
+      "base_image": "docker.io/library/debian:bookworm",
+      "glibc_floor": "2.36",
+      "notes": "Built against glibc 2.36 + Linux 6.1 UAPI floor for Valve Holo & Neptune compatibility + /run/media MicroSD & steamos-readonly checks."
+    }
+  }
+}

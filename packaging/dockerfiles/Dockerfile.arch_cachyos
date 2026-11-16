@@ -1,0 +1,14 @@
+FROM docker.io/library/archlinux:latest
+
+RUN pacman -Syu --noconfirm --needed \
+    base-devel linux-api-headers linux-headers binutils kmod \
+    clang lld llvm jdk-openjdk \
+    python python-pip pyside6 \
+    cantarell-fonts glib2 krb5 libglvnd libxkbcommon qt6-wayland xcb-util-cursor \
+ && pacman -Scc --noconfirm \
+ && python3 -m venv --system-site-packages /opt/build-venv \
+ && /opt/build-venv/bin/pip install --no-cache-dir pyinstaller
+
+ENV PATH="/opt/build-venv/bin:${PATH}"
+WORKDIR /src
+ENTRYPOINT ["/bin/bash"]

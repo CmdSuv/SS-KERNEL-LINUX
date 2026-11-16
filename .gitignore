@@ -1,0 +1,35 @@
+# Python / Bytecode / Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Build & Compiled Outputs (keep GitHub repo clean source-only; upload binaries via Releases)
+build/
+dist/
+targets/
+*.spec
+
+# Compiled C / Kernel Module Artifacts
+native/ss_kernel_probe
+kernel/*.o
+kernel/*.ko
+kernel/*.mod
+kernel/*.mod.c
+kernel/*.mod.o
+kernel/.*.cmd
+kernel/Module.symvers
+kernel/modules.order
+kernel/.tmp_versions/
+kernel/prebuilt/
+
+# Scan Outputs & Runtime Temp Files
+reports/
+*.log
+.attach_pid*
+
+# IDE / Editor
+.idea/
+.vscode/
+.DS_Store

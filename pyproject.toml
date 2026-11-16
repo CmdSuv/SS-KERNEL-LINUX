@@ -1,0 +1,13 @@
+[project]
+name = "mc-ss-forensics"
+version = "2.0.0"
+description = "Multi-layered Linux Minecraft Forensic ScreenShare (SS) Sentinel (Zero external dependencies)"
+authors = [{ name = "Omar Yiğitcan Mengü" }]
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+[project.scripts]
+ss-sentinel = "ss_sentinel:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

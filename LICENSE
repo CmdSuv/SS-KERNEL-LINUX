@@ -1,0 +1,101 @@
+MC SS Sentinel — Source-Available Non-Commercial Attribution & Immutable License
+================================================================================
+
+Copyright (c) 2026 Omar Yiğitcan Mengü (GitHub: https://github.com/CmdSuv)
+All Rights Reserved. / Tüm Hakları Saklıdır.
+
+--------------------------------------------------------------------------------
+1. LİSANS VE TELİF SAHİBİ (COPYRIGHT & AUTHORSHIP)
+--------------------------------------------------------------------------------
+Bu yazılımın, kaynak kodlarının, mimarisinin, belgelerinin ve derlenmiş
+bileşenlerinin (Bölüm 5'te belirtilen Linux çekirdek modülü istisnası saklı
+kalmak üzere) tüm fikri mülkiyet ve telif hakları münhasıran
+**Omar Yiğitcan Mengü**'ye aittir.
+
+--------------------------------------------------------------------------------
+2. İZİN VERİLEN KULLANIM (PERMITTED USE)
+--------------------------------------------------------------------------------
+Aşağıdaki Bölüm 3 ve Bölüm 4'teki tüm şartlara eksiksiz uyulması kaydıyla
+herkese ücretsiz ve geri alınabilir aşağıdaki haklar tanınır:
+  a) Kaynak kodu incelemek, derlemek ve yerel olarak çalıştırmak;
+  b) Yazılımı ve kaynak kodunu **ücretsiz (bedelsiz)** olarak kopyalamak,
+     paylaşmak, yeniden dağıtmak ve çatallamak (fork);
+  c) Kaynak kod üzerinde değişiklik yapmak veya güncellemek (türev eserler
+     oluşturmak).
+
+--------------------------------------------------------------------------------
+3. KESİN YASAKLAR (STRICT PROHIBITIONS)
+--------------------------------------------------------------------------------
+Aşağıdaki eylemler açıkça ve kesin olarak YASAKTIR:
+  a) **TİCARİ KULLANIM VE SATIŞ YASAĞI:** Bu yazılımın, kaynak kodunun,
+     derlenmiş ikililerinin veya üzerinden türetilen herhangi bir sürümün
+     tamamen ya da kısmen satılması, kiralanması, abonelik/ücret karşılığı
+     sunulması veya doğrudan/dolaylı ticari kazanç amacıyla kullanılması ya da
+     pazarlanması **yasaktır**.
+  b) **BAŞKASININ GİBİ GÖSTERME / SAHTE SAHİPLENME YASAĞI:** Bu yazılımın,
+     kaynak dosyalarının veya türetilmiş sürümlerinin asıl yazarı olan
+     **Omar Yiğitcan Mengü** ismi gizlenerek, silinerek ya da değiştirilerek
+     başka bir kişi veya kuruma aitmiş gibi sunulması, sahiplenilmesi veya
+     "kendi ürünü" gibi tanıtılması **kesinlikle yasaktır**.
+
+--------------------------------------------------------------------------------
+4. DEĞİŞMEZ LİSANS VE TELİF KORUMA ŞARTI (IMMUTABLE LICENSE REQUIREMENT)
+--------------------------------------------------------------------------------
+Bu yazılım veya içindeki herhangi bir dosya kopyalanırken, paylaşılırken,
+kullanılırken, güncellenirken veya türetilirken:
+  a) Bu orijinal `LICENSE` dosyası, içerdiği tüm hükümler ve
+     **"Copyright (c) 2026 Omar Yiğitcan Mengü"** telif bildirimi **olduğu gibi
+     (kelimesi kelimesine eksiksiz şekilde)** korunmak zorundadır.
+  b) Orijinal lisans metninin veya yazar adının kaldırılması, gizlenmesi,
+     kısaltılması ya da başka bir lisansla değiştirilmesi **hukuken yasaktır**.
+  c) Yukarıdaki şartlardan herhangi birinin ihlali halinde, bu lisans kapsamında
+     verilen tüm kullanım, kopyalama, paylaşım ve güncelleme izinleri hiçbir
+     bildirime gerek kalmaksızın kendiliğinden ve derhal sona erer; 5846 Sayılı
+     Fikir ve Sanat Eserleri Kanunu (FSEK) ve uluslararası telif hakları mevzuatı
+     kapsamında hukuki ve cezai sorumluluk doğar.
+
+--------------------------------------------------------------------------------
+5. LİNUX ÇEKİRDEK MODÜLÜ NOTU (LINUX KERNEL MODULE GPL NOTICE)
+--------------------------------------------------------------------------------
+`kernel/` dizini altında yer alan ve Linux çekirdeği başlıklarına doğrudan
+bağlanan geçici çekirdek modülü kaynak dosyaları (`kernel/mc_ss_kmod.c`,
+`kernel/mc_ss_kmod.h`, `kernel/Makefile`), Linux çekirdeği arayüz uyumluluğu
+gereği `GPL-2.0-only` lisansı ile lisanslanmıştır.
+Bu hüküm yalnızca `kernel/` dizinindeki LKM çekirdek modülü kaynak kodu için
+geçerlidir; uygulamanın diğer tüm bileşenleri (`ss_core/`, `ss_gui.py`,
+`ss_sentinel.py`, `native/`, `packaging/`, `scripts/`, `assets/`, `tests/`,
+dokümantasyon ve dağıtım bütünü) yukarıdaki Bölüm 1–4 hükümlerine tabidir ve
+bütüncül olarak **Omar Yiğitcan Mengü** adına korunmaktadır.
+
+--------------------------------------------------------------------------------
+ENGLISH SUMMARY (BINDING TRANSLATION)
+--------------------------------------------------------------------------------
+Copyright (c) 2026 Omar Yiğitcan Mengü. All Rights Reserved.
+
+Permission is granted solely to inspect, copy, share, compile, run, and update
+this software and its source code free of charge, subject strictly to the
+following binding conditions:
+  1. NO SALE OR COMMERCIAL EXPLOITATION: You may NOT sell, rent, license for a
+     fee, monetize, or commercially exploit this software, its binaries, or any
+     derivative work thereof, in whole or in part.
+  2. NO MISREPRESENTATION / MANDATORY ATTRIBUTION: You may NOT claim authorship,
+     rebrand as your own work, or remove or obscure the original author's name
+     (**Omar Yiğitcan Mengü**).
+  3. IMMUTABLE LICENSE PRESERVATION: Whenever any part of this work is copied,
+     shared, used, distributed, or updated/modified, this original `LICENSE` file
+     and copyright notice MUST remain intact and unmodified in full. Altering,
+     removing, or replacing this license is strictly and legally prohibited, and
+     automatically terminates all granted rights.
+  4. EXCEPTION FOR LINUX KERNEL MODULE: Kernel-space LKM files under `kernel/`
+     (`mc_ss_kmod.c`, `mc_ss_kmod.h`, `Makefile`) are licensed under `GPL-2.0-only`
+     as required to interface with the Linux kernel; all remaining components
+     and the software distribution as a whole remain strictly governed by Sections
+     1–4 above.
+
+--------------------------------------------------------------------------------
+6. SORUMLULUK REDDİ (DISCLAIMER OF WARRANTY)
+--------------------------------------------------------------------------------
+BU YAZILIM "OLDUĞU GİBİ" (AS IS) SUNULMAKTADIR; SATILABİLİRLİK, BELİRLİ BİR
+AMACA UYGUNLUK VEYA İHLAL ETMEME GARANTİLERİ DAHİL OLMAK ÜZERE AÇIK YA DA ZIMNİ
+HİÇBİR GARANTİ VERİLMEZ. YAZILIMIN KULLANIMINDAN DOĞABİLECEK HİÇBİR DOĞRUDAN
+VEYA DOLAYLI ZARARDAN TELİF SAHİBİ SORUMLU TUTULAMAZ.
