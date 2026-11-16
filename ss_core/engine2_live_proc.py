@@ -19,6 +19,7 @@ from .signatures import (
     STRICT_CHEAT_IDENTIFIERS,
 )
 from .utils import (
+    build_bytes_trie_pattern,
     emit_scan_progress,
     match_cheat_signatures,
     record_scan_region,
@@ -175,17 +176,12 @@ _RAM_STRICT_TERMS: tuple[bytes, ...] = tuple(
     )
 )
 
-_RAM_STRICT_CS_RE = re.compile(
-    b"|".join(re.escape(t) for t in _RAM_STRICT_TERMS),
-)
-
-_RAM_STRICT_BOUNDED_CS_RE = re.compile(
-    b"|".join(re.escape(t) for t in _RAM_STRICT_BOUNDED_TERMS),
-)
+_RAM_STRICT_SET: frozenset[bytes] = frozenset(_RAM_STRICT_TERMS)
+_RAM_STRICT_BOUNDED_SET: frozenset[bytes] = frozenset(_RAM_STRICT_BOUNDED_TERMS)
 
 _RAM_STRICT_UTF16_CS_RE = re.compile(
-    b"|".join(
-        re.escape(t.decode("ascii").encode("utf-16le"))
+    build_bytes_trie_pattern(
+        t.decode("ascii").encode("utf-16le")
         for t in (_RAM_STRICT_TERMS + _RAM_STRICT_BOUNDED_TERMS)
     ),
 )
@@ -198,6 +194,21 @@ _RAM_CLUSTER_TERMS: tuple[bytes, ...] = (
     b"aimassist",
     b"selfdestruct",
     b"cheststealer",
+    b"autototem",
+    b"crystalaura",
+    b"anchoraura",
+    b"maceswap",
+    b"breachswap",
+    b"automace",
+    b"spearswap",
+    b"spearaura",
+    b"attributeswap",
+    b"stunslam",
+    b"autowindcharge",
+    b"fakelag",
+    b"packetmine",
+    b"seedcracker",
+    b"tweakeroo",
     b"scaffold",
     b"antivelocity",
     b"antiknockback",
@@ -211,9 +222,10 @@ _RAM_CLUSTER_TERMS: tuple[bytes, ...] = (
     b"nametags",
     b"tracers",
 )
-# Bare lowercase cluster regex (word/CamelCase boundaries verified in Python only on actual hits)
-_RAM_CLUSTER_CS_RE = re.compile(
-    b"(" + b"|".join(re.escape(t) for t in _RAM_CLUSTER_TERMS) + b")",
+_RAM_CLUSTER_SET: frozenset[bytes] = frozenset(_RAM_CLUSTER_TERMS)
+# Single-pass prefix-trie regex combining strict, bounded-strict, and cluster terms (~15-30x faster on large RAM)
+_RAM_ASCII_TRIE_RE = re.compile(
+    build_bytes_trie_pattern(set(_RAM_STRICT_TERMS) | set(_RAM_STRICT_BOUNDED_TERMS) | set(_RAM_CLUSTER_TERMS))
 )
 
 _HIGH_SIG_BYTES: frozenset[bytes] = frozenset(t.encode("ascii") for t in HIGH_SIGNAL_MODULE_NAMES)
@@ -1190,42 +1202,44 @@ def _scan_region_bytes(
     low_data = data.lower()
     n = len(data)
 
-    # 1. Strict ASCII & UTF-16LE signatures (case-sensitive on pre-lowered bytes -> ~20x faster than IGNORECASE)
-    for m in _RAM_STRICT_CS_RE.finditer(low_data):
-        term = m.group(0).decode("ascii", errors="replace")
-        if len(strict_hits.get(term, [])) < 5:
-            start = max(0, m.start() - 32)
-            end = min(n, m.end() + 48)
-            snippet = data[start:end].decode("ascii", errors="replace")
-            snippet_clean = "".join(ch if 32 <= ord(ch) < 127 else "." for ch in snippet)
-            strict_hits.setdefault(term, []).append(
-                f"0x{base_addr + m.start():x} ({pathname or 'anon'}): ...{snippet_clean}..."
-            )
-    for m in _RAM_STRICT_BOUNDED_CS_RE.finditer(low_data):
+    allow_cluster = (
+        not pathname or "/tmp/" in pathname or "(deleted)" in pathname or "anon" in pathname or "/memfd:" in pathname
+    )
+    win = 65536
+    buckets: dict[int, set[bytes]] = {}
+
+    # 1. Single-pass ASCII trie matching strict, bounded-strict, and contextual cluster signatures
+    for m in _RAM_ASCII_TRIE_RE.finditer(low_data):
+        mbytes = m.group(0)
         st, en = m.span()
-        ok_start = (
-            st == 0
-            or not _is_ram_ident_byte(low_data[st - 1])
-            or (((97 <= data[st - 1] <= 122) or (48 <= data[st - 1] <= 57)) and (65 <= data[st] <= 90))
-        )
-        if not ok_start:
-            continue
-        ok_end = (
-            en == n
-            or not _is_ram_ident_byte(low_data[en])
-            or ((65 <= data[en] <= 90) and not (65 <= data[en - 1] <= 90))
-        )
-        if not ok_end:
-            continue
-        term = m.group(0).decode("ascii", errors="replace")
-        if len(strict_hits.get(term, [])) < 5:
-            start = max(0, st - 32)
-            end = min(n, en + 48)
-            snippet = data[start:end].decode("ascii", errors="replace")
-            snippet_clean = "".join(ch if 32 <= ord(ch) < 127 else "." for ch in snippet)
-            strict_hits.setdefault(term, []).append(
-                f"0x{base_addr + st:x} ({pathname or 'anon'}): ...{snippet_clean}..."
+        is_strict = mbytes in _RAM_STRICT_SET
+        needs_boundary = (mbytes in _RAM_STRICT_BOUNDED_SET) or (allow_cluster and (mbytes in _RAM_CLUSTER_SET))
+        boundary_ok = False
+        if needs_boundary:
+            ok_start = (
+                st == 0
+                or not _is_ram_ident_byte(low_data[st - 1])
+                or (((97 <= data[st - 1] <= 122) or (48 <= data[st - 1] <= 57)) and (65 <= data[st] <= 90))
             )
+            if ok_start:
+                boundary_ok = (
+                    en == n
+                    or not _is_ram_ident_byte(low_data[en])
+                    or ((65 <= data[en] <= 90) and not (65 <= data[en - 1] <= 90))
+                )
+        if is_strict or ((mbytes in _RAM_STRICT_BOUNDED_SET) and boundary_ok):
+            term = mbytes.decode("ascii", errors="replace")
+            if len(strict_hits.get(term, [])) < 5:
+                start = max(0, st - 32)
+                end = min(n, en + 48)
+                snippet = data[start:end].decode("ascii", errors="replace")
+                snippet_clean = "".join(ch if 32 <= ord(ch) < 127 else "." for ch in snippet)
+                strict_hits.setdefault(term, []).append(
+                    f"0x{base_addr + st:x} ({pathname or 'anon'}): ...{snippet_clean}..."
+                )
+        if allow_cluster and (mbytes in _RAM_CLUSTER_SET) and boundary_ok:
+            buckets.setdefault(st // win, set()).add(mbytes)
+
     if b"\x00" in low_data:
         for m in _RAM_STRICT_UTF16_CS_RE.finditer(low_data):
             term = m.group(0).decode("utf-16le", errors="replace")
@@ -1234,27 +1248,8 @@ def _scan_region_bytes(
                     f"0x{base_addr + m.start():x} [UTF-16LE] ({pathname or 'anon'})"
                 )
 
-    # 2. Contextual module clustering (only in non-system mappings or anonymous heap/metaspace/memfd)
-    if not pathname or "/tmp/" in pathname or "(deleted)" in pathname or "anon" in pathname or "/memfd:" in pathname:
-        # Single-pass scan over chunk, bucketed into 64 KB windows with word & CamelCase boundary verification
-        win = 65536
-        buckets: dict[int, set[bytes]] = {}
-        for m in _RAM_CLUSTER_CS_RE.finditer(low_data):
-            st, en = m.span()
-            ok_start = (
-                st == 0
-                or not _is_ram_ident_byte(low_data[st - 1])
-                or (((97 <= data[st - 1] <= 122) or (48 <= data[st - 1] <= 57)) and (65 <= data[st] <= 90))
-            )
-            if not ok_start:
-                continue
-            ok_end = (
-                en == n
-                or not _is_ram_ident_byte(low_data[en])
-                or ((65 <= data[en] <= 90) and not (65 <= data[en - 1] <= 90))
-            )
-            if ok_end:
-                buckets.setdefault(st // win, set()).add(m.group(1))
+    # 2. Evaluate bucketed contextual module clustering
+    if allow_cluster and buckets:
         for bidx, found_terms in buckets.items():
             if len(found_terms) >= 3 and (found_terms & _HIGH_SIG_BYTES):
                 if len(cluster_hits) < 8:
@@ -1802,12 +1797,19 @@ def run(ctx: ScanContext) -> None:
         ctx.telemetry["minecraft_pids"] = [p.pid for p in procs if p.is_minecraft]
 
         # Perform deep RAM scanning on Minecraft, Java, Wine, or any flagged suspicious process
-        mem_targets = [
-            proc
-            for proc in procs
-            if proc.is_suspicious
-            or ((proc.is_minecraft or proc.is_java or proc.is_wine) and not _is_electron_helper(proc))
-        ]
+        # Prioritize direct Minecraft/Java/suspicious targets before Wine helper daemons.
+        mem_targets = sorted(
+            [
+                proc
+                for proc in procs
+                if proc.is_suspicious
+                or ((proc.is_minecraft or proc.is_java or proc.is_wine) and not _is_electron_helper(proc))
+            ],
+            key=lambda p: (
+                0 if (p.is_minecraft or p.is_suspicious) else (1 if p.is_java else 2),
+                p.pid,
+            ),
+        )
         n_mem = max(1, len(mem_targets))
         for idx, proc in enumerate(mem_targets):
             frac = 0.55 + (0.37 * (idx / n_mem))

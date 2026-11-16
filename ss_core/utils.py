@@ -22,6 +22,7 @@ from .models import ScanContext
 from .signatures import (
     CONTEXTUAL_CHEAT_MODULES,
     HIGH_SIGNAL_MODULE_NAMES,
+    RESTRICTED_UTILITY_MOD_IDENTIFIERS,
     STRICT_CHEAT_IDENTIFIERS,
 )
 
@@ -350,26 +351,120 @@ def normalize_identifier_tokens(raw: str) -> str:
     return s.lower()
 
 
+def build_str_trie_pattern(terms: Iterable[str]) -> str:
+    """Compile an iterable of literal strings into a prefix-trie regex alternation."""
+    root: dict[str | None, object] = {}
+    for w in sorted({t for t in terms if t}):
+        node = root
+        for ch in w:
+            nxt = node.get(ch)
+            if nxt is None:
+                nxt = {}
+                node[ch] = nxt
+            node = nxt  # type: ignore[assignment]
+        node[None] = True
+    if not root:
+        return r"(?!)"
+
+    def _emit(node: dict[str | None, object]) -> str:
+        has_end = None in node
+        children = sorted(k for k in node if k is not None)
+        if not children:
+            return ""
+        if len(children) == 1 and not has_end:
+            c = children[0]
+            return re.escape(c) + _emit(node[c])  # type: ignore[arg-type]
+        alts: list[str] = []
+        leaf_chars: list[str] = []
+        for c in children:
+            sub = node[c]  # type: ignore[assignment]
+            if len(sub) == 1 and None in sub:  # type: ignore[arg-type]
+                leaf_chars.append(c)
+            else:
+                alts.append(re.escape(c) + _emit(sub))  # type: ignore[arg-type]
+        if len(leaf_chars) == 1:
+            alts.append(re.escape(leaf_chars[0]))
+        elif len(leaf_chars) > 1:
+            alts.append("[" + "".join(re.escape(c) for c in leaf_chars) + "]")
+        body = alts[0] if len(alts) == 1 else "(?:" + "|".join(alts) + ")"
+        return f"(?:{body})?" if has_end else body
+
+    return _emit(root)
+
+
+def build_bytes_trie_pattern(terms: Iterable[bytes]) -> bytes:
+    """Compile an iterable of literal byte strings into a prefix-trie regex alternation."""
+    root: dict[int | None, object] = {}
+    for w in sorted({t for t in terms if t}):
+        node = root
+        for b in w:
+            nxt = node.get(b)
+            if nxt is None:
+                nxt = {}
+                node[b] = nxt
+            node = nxt  # type: ignore[assignment]
+        node[None] = True
+    if not root:
+        return b"(?!)"
+
+    def _emit(node: dict[int | None, object]) -> bytes:
+        has_end = None in node
+        children = sorted(k for k in node if k is not None)
+        if not children:
+            return b""
+        if len(children) == 1 and not has_end:
+            c = children[0]
+            return re.escape(bytes([c])) + _emit(node[c])  # type: ignore[arg-type]
+        alts: list[bytes] = []
+        leaf_bytes: list[int] = []
+        for c in children:
+            sub = node[c]  # type: ignore[assignment]
+            if len(sub) == 1 and None in sub:  # type: ignore[arg-type]
+                leaf_bytes.append(c)
+            else:
+                alts.append(re.escape(bytes([c])) + _emit(sub))  # type: ignore[arg-type]
+        if len(leaf_bytes) == 1:
+            alts.append(re.escape(bytes([leaf_bytes[0]])))
+        elif len(leaf_bytes) > 1:
+            alts.append(b"[" + b"".join(re.escape(bytes([c])) for c in leaf_bytes) + b"]")
+        body = alts[0] if len(alts) == 1 else b"(?:" + b"|".join(alts) + b")"
+        return b"(?:" + body + b")?" if has_end else body
+
+    return _emit(root)
+
+
 _ANY_CHEAT_LITERAL_RE = re.compile(
-    "|".join(
-        re.escape(s.lower())
-        for s in sorted(set(STRICT_CHEAT_IDENTIFIERS) | set(CONTEXTUAL_CHEAT_MODULES), key=len, reverse=True)
-    )
+    build_str_trie_pattern(s.lower() for s in (set(STRICT_CHEAT_IDENTIFIERS) | set(CONTEXTUAL_CHEAT_MODULES)))
 )
 
 _STRICT_CS_PATTERN = re.compile(
-    "|".join(re.escape(s.lower()) for s in sorted(STRICT_CHEAT_IDENTIFIERS, key=len, reverse=True))
+    build_str_trie_pattern(s.lower() for s in STRICT_CHEAT_IDENTIFIERS)
 )
 
 # Single-pass CamelCase-aware boundary alternation for contextual modules:
 # - Matches `KillAura`, `AutoClicker`, `myKillAuraMod`, `showHitboxes`, `kill_aura`, `KILLAURA`
 # - Still respects word boundaries so `breach` != `reach` and `timer1` != `timer`
-_CTX_ALT = "|".join(re.escape(term.lower()) for term in sorted(CONTEXTUAL_CHEAT_MODULES, key=len, reverse=True))
+_CTX_TRIE = build_str_trie_pattern(term.lower() for term in CONTEXTUAL_CHEAT_MODULES)
 _CONTEXT_COMBINED_RE = re.compile(
     r"(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]))"
-    rf"(?i:({_CTX_ALT}))"
+    rf"(?i:({_CTX_TRIE}))"
     r"(?:(?![A-Za-z0-9])|(?<![A-Z])(?=[A-Z]))"
 )
+
+
+_RESTRICTED_MOD_TRIE = build_str_trie_pattern(term.lower() for term in RESTRICTED_UTILITY_MOD_IDENTIFIERS)
+_RESTRICTED_MOD_RE = re.compile(
+    r"(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z]))"
+    rf"(?i:({_RESTRICTED_MOD_TRIE}))"
+    r"(?:(?![A-Za-z0-9])|(?<![A-Z])(?=[A-Z]))"
+)
+
+
+def match_restricted_utility_mods(raw_text: str) -> list[str]:
+    """Match text against competitive-server banned/restricted utility mod IDs."""
+    if not raw_text or not RESTRICTED_UTILITY_MOD_IDENTIFIERS:
+        return []
+    return sorted({m.group(1).lower() for m in _RESTRICTED_MOD_RE.finditer(raw_text)})
 
 
 def match_cheat_signatures(raw_text: str) -> tuple[list[str], list[str], list[str]]:
@@ -541,6 +636,8 @@ def discover_minecraft_roots(ctx: ScanContext) -> list[tuple[str, Path]]:
     for pfx_parent in (
         h / ".local/share/wineprefixes",
         h / "Games/Heroic/Prefixes",
+        h / ".local/share/bottles/bottles",
+        h / ".var/app/com.usebottles.bottles/data/bottles/bottles",
     ):
         if pfx_parent.is_dir():
             try:

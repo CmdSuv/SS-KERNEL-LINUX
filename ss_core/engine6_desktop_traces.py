@@ -44,11 +44,19 @@ WINDOWS_CHEAT_KEYWORDS: tuple[str, ...] = (
     "icetea",
     "krypton",
     "itami",
+    "anubisclient",
+    "prestigeclient",
+    "nursultan",
+    "catlean",
+    "wexside",
+    "expensiveclient",
     "opautoclicker",
     "gsautoclicker",
     "speedautoclicker",
+    "citronclicker",
     "autoclicker",
     "tinytask",
+    "autohotkey",
     "cheatengine",
     "cheat engine",
     "processhacker",
@@ -60,7 +68,8 @@ WINDOWS_CHEAT_KEYWORDS: tuple[str, ...] = (
 _WIN_CHEAT_RE = re.compile(
     r"(?<![a-z0-9])(?:"
     r"vape(?:v4|lite)?|driplite|slinky|whiteout|krypton|itami|icetea|"
-    r"opautoclicker|gsautoclicker|speedautoclicker|autoclicker|tinytask|"
+    r"anubisclient|prestigeclient|nursultan|catlean|wexside|expensiveclient|"
+    r"opautoclicker|gsautoclicker|speedautoclicker|citronclicker|autoclicker|tinytask|autohotkey|"
     r"cheat\s*engine|process\s*hacker|x64dbg|extreme\s*injector|xenos\s*injector"
     r")(?![a-z0-9])",
     re.IGNORECASE,
@@ -593,6 +602,12 @@ def _check_wine_and_proton(ctx: ScanContext) -> None:
     heroic_pfx = h / "Games/Heroic/Prefixes"
     if heroic_pfx.is_dir():
         reg_files.extend(heroic_pfx.glob("*/*.reg"))
+    for bottles_dir in (
+        h / ".local/share/bottles/bottles",
+        h / ".var/app/com.usebottles.bottles/data/bottles/bottles",
+    ):
+        if bottles_dir.is_dir():
+            reg_files.extend(bottles_dir.glob("*/*.reg"))
     for live_wp in ctx.telemetry.get("live_wine_prefixes", []):
         lwp = Path(live_wp)
         if lwp.is_dir():

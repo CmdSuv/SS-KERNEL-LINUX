@@ -31,11 +31,13 @@ from .signatures import (
     XRAY_SENSITIVE_BLOCK_TEXTURES,
 )
 from .utils import (
+    build_bytes_trie_pattern,
     discover_minecraft_roots,
     emit_scan_progress,
     fmt_ns,
     iter_files_safe,
     match_cheat_signatures,
+    match_restricted_utility_mods,
     read_xattrs,
     record_scan_region,
     safe_read_bytes,
@@ -100,17 +102,13 @@ _OBFUSCATOR_RE = re.compile("|".join(re.escape(x) for x in OBFUSCATOR_MARKERS))
 _SUSP_API_RE = re.compile("|".join(re.escape(x) for x in JVM_SUSPICIOUS_API_SYMBOLS))
 _CLASS_BYTES_PREFILTER_RE = re.compile(
     b"(?i:"
-    + "|".join(
-        re.escape(x)
-        for x in sorted(
-            {
-                *(__import__("ss_core.signatures", fromlist=["STRICT_CHEAT_IDENTIFIERS"]).STRICT_CHEAT_IDENTIFIERS),
-                *(__import__("ss_core.signatures", fromlist=["CONTEXTUAL_CHEAT_MODULES"]).CONTEXTUAL_CHEAT_MODULES),
-            },
-            key=len,
-            reverse=True,
+    + build_bytes_trie_pattern(
+        s.lower().encode("ascii")
+        for s in (
+            set(__import__("ss_core.signatures", fromlist=["STRICT_CHEAT_IDENTIFIERS"]).STRICT_CHEAT_IDENTIFIERS)
+            | set(__import__("ss_core.signatures", fromlist=["CONTEXTUAL_CHEAT_MODULES"]).CONTEXTUAL_CHEAT_MODULES)
         )
-    ).encode("ascii")
+    )
     + b")|"
     + _OBFUSCATOR_RE.pattern.encode("ascii")
     + b"|awt/Robot|tools/attach|Instrumentation|retransformClasses|redefineClasses"
@@ -915,6 +913,10 @@ def _inspect_script_for_cheat_or_antiforensics(ctx: ScanContext, path: Path, dat
 # ---------------------------------------------------------------------------
 # 5. Deep JAR / ZIP Inspector (Metadata, Constant Pool, Mixins, JiJ, Resource/Shader Packs)
 # ---------------------------------------------------------------------------
+def _matches_popular_mod_brand(base_low: str, brand: str) -> bool:
+    return re.search(rf"(?<![a-z0-9]){re.escape(brand)}(?![a-z0-9])", base_low) is not None
+
+
 def _check_spoofed_mod_name(
     ctx: ScanContext,
     display_path: str,
@@ -927,7 +929,7 @@ def _check_spoofed_mod_name(
     base_low = os.path.basename(display_path).lower()
     all_identity = f"{' '.join(mod_ids)} {' '.join(mod_names)} {' '.join(mod_entrypoints)}".lower()
     for brand, expected_tokens in POPULAR_MOD_IDENTITY_MAP.items():
-        if brand in base_low and not any(tok in all_identity for tok in expected_tokens):
+        if _matches_popular_mod_brand(base_low, brand) and not any(tok in all_identity for tok in expected_tokens):
             ctx.add_finding(
                 Finding(
                     rule_id="E4-JAR-SPOOFED-MOD-NAME",
@@ -967,7 +969,7 @@ def _check_jar_cache(
             return True
         return False
     base_low_pre = os.path.basename(display_path).lower()
-    if jar_digest in clean_jar_digests and not any(b in base_low_pre for b in POPULAR_MOD_IDENTITY_MAP):
+    if jar_digest in clean_jar_digests and not any(_matches_popular_mod_brand(base_low_pre, b) for b in POPULAR_MOD_IDENTITY_MAP):
         return True
     return False
 
@@ -1225,6 +1227,26 @@ def _analyze_jar_zip(
                     path=display_path,
                 )
             )
+        else:
+            rest_m = match_restricted_utility_mods(meta_joined)
+            if rest_m:
+                ctx.add_finding(
+                    Finding(
+                        rule_id="E4-JAR-RESTRICTED-MOD",
+                        engine=ENGINE_NAME,
+                        severity=Severity.MEDIUM,
+                        confidence=Confidence.CONFIRMED,
+                        category="Restricted Utility Mod",
+                        title=f"Rekabetci sunucularda yasakli/kisitli mod tespit edildi: {os.path.basename(display_path)}",
+                        description="Mod metadatasi cogu PvP/SMP sunucusunda yasaklanan veya kisitlanan yardimci/otomasyon modu iceriyor.",
+                        evidence=[
+                            f"Mod ID: {', '.join(mod_ids) or 'N/A'}",
+                            f"Mod Adi: {', '.join(mod_names) or 'N/A'}",
+                            f"Kisitli Mod(lar): {', '.join(rest_m)}",
+                        ],
+                        path=display_path,
+                    )
+                )
 
         # Spoofed popular mod filename check
         _check_spoofed_mod_name(ctx, display_path, mod_ids, mod_names, mod_entrypoints)
@@ -1882,6 +1904,22 @@ def inspect_single_file(
                 path=str(path),
             )
         )
+    elif is_mc_dir and path.suffix.lower() in (".jar", ".zip", ".json", ".toml", ".cfg"):
+        rest_n = match_restricted_utility_mods(path.name)
+        if rest_n:
+            ctx.add_finding(
+                Finding(
+                    rule_id="E4-FILE-RESTRICTED-MOD",
+                    engine=ENGINE_NAME,
+                    severity=Severity.MEDIUM,
+                    confidence=Confidence.HIGH,
+                    category="Restricted Utility Mod File",
+                    title=f"Minecraft icinde kisitli/yasakli utility mod dosyasi: {path.name}",
+                    description="Dosya adi PvP/SMP sunucularinda cogunlukla yasaklanan bir utility mod ile eslesiyor.",
+                    evidence=[f"Kisitli Mod(lar): {', '.join(rest_n)}", f"Yol: {path}"],
+                    path=str(path),
+                )
+            )
 
     # Hidden dotfile check inside Minecraft mods/resourcepacks/shaderpacks
     if is_mc_dir and path.name.startswith(".") and path.suffix.lower() in (".jar", ".zip", ".so", ".exe"):

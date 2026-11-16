@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+import json
 import os
 import sqlite3
 import stat
@@ -946,6 +947,100 @@ class TestReviewerAuditHardeningRegressions(unittest.TestCase):
             self.assertFalse(res_rb["ok"])
             self.assertFalse(res_rb["changed"])
             self.assertEqual(orig_grub.strip(), grub_cfg.read_text(encoding="utf-8").strip())
+
+    def test_expanded_cheat_mace_spear_restricted_mods_and_bottles(self) -> None:
+        from ss_core import engine4_deep_files, engine5_minecraft, engine6_desktop_traces
+        from ss_core.utils import match_cheat_signatures, match_restricted_utility_mods
+
+        # 1. Strict client / mace / spear / exploit IDs & high-signal modules
+        s_hits, h_hits, _ = match_cheat_signatures(
+            "AnubisClient PrestigeClient Nursultan Catlean BetterMaceSwap BreachSwap "
+            "SpearSwapper AutoLungeSwap AutoWindCharge SeedCrackerX ServerSeeker Litematica-Printer"
+        )
+        for token in ("anubisclient", "prestigeclient", "nursultan", "catlean", "bettermaceswap", "breachswap", "spearswapper", "autolungeswap", "autowindcharge", "seedcrackerx", "serverseeker", "litematica-printer"):
+            self.assertIn(token, s_hits)
+
+        _, h_mods, c_mods = match_cheat_signatures("MaceKill SpearAura SpearKill AttributeSwapper PacketMine Backtrack")
+        for tok in ("macekill", "spearaura", "spearkill", "attributeswapper", "packetmine"):
+            self.assertIn(tok, h_mods)
+        self.assertIn("backtrack", c_mods)
+
+        # 2. Clean English, vanilla 1.21+ item/block names & perf mod strings must NOT false-positive
+        clean_blob = (
+            "breach outreach skilled claimassistants argon-performance-fabric "
+            "francium optimization vanilla mace spear wind_charge density spectral_arrow "
+            "net/caffeinemc/mods/sodium/SodiumClientMod"
+        )
+        self.assertEqual(([], [], []), match_cheat_signatures(clean_blob))
+        self.assertEqual([], match_restricted_utility_mods(clean_blob))
+        s_pd, h_pd, c_pd = match_cheat_signatures("net/minecraft/TrialSpawner PlayerDetector")
+        self.assertEqual((s_pd, h_pd), ([], []))
+        self.assertEqual(c_pd, ["playerdetector"])
+        self.assertEqual(
+            ["cutthrough", "inventoryprofilesnext", "potionrefill"],
+            match_restricted_utility_mods("inventoryprofilesnext cutthrough potionrefill"),
+        )
+
+        # 3. Restricted utility mod JAR -> E4-JAR-RESTRICTED-MOD (MEDIUM), deleted in latest.log -> E5-LOG-MISSING-RESTRICTED-MOD (HIGH)
+        with tempfile.TemporaryDirectory() as td:
+            home, root, proc = build_clean_baseline(Path(td))
+            mc = home / ".minecraft"
+            (mc / "mods").mkdir(parents=True, exist_ok=True)
+            (mc / "logs").mkdir(parents=True, exist_ok=True)
+
+            jar_path = mc / "mods" / "tweakeroo-fabric-1.21.jar"
+            with zipfile.ZipFile(jar_path, "w") as zf:
+                zf.writestr("fabric.mod.json", json.dumps({"schemaVersion": 1, "id": "tweakeroo", "name": "Tweakeroo"}))
+            (mc / "logs" / "latest.log").write_text(
+                "[12:00:00] [main/INFO]: Loading 2 mods:\n\t- tweakeroo 0.21.0\n\t- chesttracker 2.4.0\n"
+                "[12:00:05] [Render thread/INFO]: [System] [CHAT] Admin -> banned mods: autototem baritone freecam\n",
+                encoding="utf-8",
+            )
+
+            ctx = ScanContext(home_dir=home, root_prefix=root, proc_root=proc, live_mode=False)
+            engine4_deep_files.run(ctx)
+            engine5_minecraft.run(ctx)
+            self.assertFalse(any(f.rule_id == "E5-LOG-CHEAT-TRACE" for f in ctx.findings))
+
+            e4_rest = [f for f in ctx.findings if f.rule_id == "E4-JAR-RESTRICTED-MOD"]
+            self.assertTrue(e4_rest)
+            self.assertEqual(Severity.MEDIUM, e4_rest[0].severity)
+
+            e5_rest = [f for f in ctx.findings if f.rule_id == "E5-LOG-MISSING-RESTRICTED-MOD"]
+            self.assertTrue(e5_rest)
+            self.assertEqual(Severity.HIGH, e5_rest[0].severity)
+
+            # 4. Flatpak Bottles Wine prefix user.reg + AnubisClient execution trace
+            bottles_pfx = home / ".var/app/com.usebottles.bottles/data/bottles/bottles/MCLauncher"
+            (bottles_pfx / "drive_c").mkdir(parents=True, exist_ok=True)
+            (bottles_pfx / "user.reg").write_text(
+                '[Software\\\\Classes\\\\AnubisClient]\n"LastRun"="C:\\\\Users\\\\kuzey\\\\Desktop\\\\AnubisClient.exe"\n',
+                encoding="utf-8",
+            )
+            ctx_b = ScanContext(home_dir=home, root_prefix=root, proc_root=proc, live_mode=False)
+            engine6_desktop_traces.run(ctx_b)
+            self.assertTrue(any(f.rule_id == "E6-WINE-REG-CHEAT" for f in ctx_b.findings))
+
+            # 5. Spoofed ModernFix catches mismatch; 'premium-helper.jar' does NOT false-positive on 'emi'
+            spoof_jar = mc / "mods" / "modernfix-5.19.jar"
+            with zipfile.ZipFile(spoof_jar, "w") as zf:
+                zf.writestr("fabric.mod.json", json.dumps({"schemaVersion": 1, "id": "evilmod", "name": "EvilMod"}))
+            legit_prem = mc / "mods" / "premium-helper-1.0.jar"
+            with zipfile.ZipFile(legit_prem, "w") as zf:
+                zf.writestr("fabric.mod.json", json.dumps({"schemaVersion": 1, "id": "premiumhelper", "name": "Premium Helper"}))
+            ctx_sp = ScanContext(home_dir=home, root_prefix=root, proc_root=proc, live_mode=False)
+            engine4_deep_files.run(ctx_sp)
+            spoofs = [f.path for f in ctx_sp.findings if f.rule_id == "E4-JAR-SPOOFED-MOD-NAME"]
+            self.assertTrue(any("modernfix-5.19.jar" in str(p) for p in spoofs))
+            self.assertFalse(any("premium-helper-1.0.jar" in str(p) for p in spoofs))
+
+            # 6. Prefix trie matches both shorter & longer terms accurately
+            s_ov, h_ov, _ = match_cheat_signatures("AutoClick AutoClicker MaceSwap MaceSwapper VapeLite")
+            self.assertIn("vapelite", s_ov)
+            self.assertIn("maceswap", s_ov)
+            self.assertIn("maceswapper", s_ov)
+            self.assertIn("autoclick", h_ov)
+            self.assertIn("autoclicker", h_ov)
 
 
 if __name__ == "__main__":

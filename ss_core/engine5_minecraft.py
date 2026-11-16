@@ -15,6 +15,7 @@ from .utils import (
     discover_minecraft_roots,
     emit_scan_progress,
     match_cheat_signatures,
+    match_restricted_utility_mods,
     record_scan_region,
     safe_read_bytes,
     safe_read_text,
@@ -62,6 +63,74 @@ CHEAT_FOLDER_NAMES: frozenset[str] = frozenset(
         "salhack",
         "phobos",
         "vape",
+        "anubis",
+        "anubis-client",
+        "anubisclient",
+        "prestige",
+        "prestigeclient",
+        "argon-client",
+        "argonclient",
+        "nursultan",
+        "expensive",
+        "excellent",
+        "catlean",
+        "wexside",
+        "neverhook",
+        "akrien",
+        "deadcode",
+        "zamorozka",
+        "mio",
+        "shoreline",
+        "konas",
+        "pyro",
+        "abyss",
+        "ares",
+        "lambda",
+        "astolfo",
+        "augustus",
+        "rise",
+        "moon",
+        "breeze",
+        "opal",
+        "myau",
+        "slinky",
+        "entropy",
+        "whiteout",
+        "drip",
+        "fdp",
+        "fdpclient",
+        "crosssine",
+        "nightx",
+        "aoba",
+        "trouserstreak",
+        "blackout",
+        "higtools",
+        "glazed",
+        "bettermaceswap",
+        "automace",
+        "breachswap",
+        "spearswapper",
+        "seedcracker",
+        "seedcrackerx",
+        "serverseeker",
+        "litematica-printer",
+        "banana-plus",
+        "bananahack",
+        "venomhack",
+        "bephax",
+        "reaper-addon",
+        "saturn",
+        "vector-addon",
+        "tanuki",
+        "zeon",
+        "orion",
+        "stardust",
+        "gothaj",
+        "dortware",
+        "radium",
+        "forgehax",
+        "monoton",
+        "zenith",
     }
 )
 
@@ -505,7 +574,7 @@ def _inspect_logs_and_crashes(ctx: ScanContext, label: str, inst_dir: Path) -> N
                     )
                     strict, high_ctx, _ = match_cheat_signatures(line)
                     line_hits = strict + high_ctx
-                    if strict:
+                    if strict and not is_chat_line:
                         cheat_lines.append(f"[{','.join(strict)}] {line.strip()[:200]}")
                         if any(x not in ("gammautils", "fullbright") for x in line_hits):
                             only_gamma_hits = False
@@ -542,6 +611,7 @@ def _inspect_logs_and_crashes(ctx: ScanContext, label: str, inst_dir: Path) -> N
         if is_latest_or_debug and logged_mods:
             missing_from_disk: list[str] = []
             missing_cheat_mods: list[str] = []
+            missing_restricted_mods: list[str] = []
             for mid in sorted(set(logged_mods)):
                 if mid in BUILTIN_OR_NOISE_MODIDS or mid.startswith("fabric-") or mid.startswith("quilt_"):
                     continue
@@ -555,6 +625,8 @@ def _inspect_logs_and_crashes(ctx: ScanContext, label: str, inst_dir: Path) -> N
                     s, h, _ = match_cheat_signatures(mid)
                     if s or h or mid in CHEAT_FOLDER_NAMES:
                         missing_cheat_mods.append(mid)
+                    elif match_restricted_utility_mods(mid):
+                        missing_restricted_mods.append(mid)
                     else:
                         missing_from_disk.append(mid)
 
@@ -569,6 +641,20 @@ def _inspect_logs_and_crashes(ctx: ScanContext, label: str, inst_dir: Path) -> N
                         title=f"{lf.name} icinde yuklendigi gorulen HILE modu mods/ klasorunden SILINMIS ({label})",
                         description="Log dosyasi oyunun bu modla basladigini gosteriyor ancak su an diskte yok!",
                         evidence=[f"Silinen hile modlari: {', '.join(missing_cheat_mods)}"],
+                        path=str(lf),
+                    )
+                )
+            if missing_restricted_mods:
+                ctx.add_finding(
+                    Finding(
+                        rule_id="E5-LOG-MISSING-RESTRICTED-MOD",
+                        engine=ENGINE_NAME,
+                        severity=Severity.HIGH,
+                        confidence=Confidence.CONFIRMED,
+                        category="Post-Launch Deleted Restricted Mod",
+                        title=f"{lf.name} icinde yuklenen yasakli/kisitli mod mods/ klasorunden SILINMIS ({label})",
+                        description="Log dosyasi sunucularda kisitli bir utility modun yuklendigini gosteriyor ancak mod su an diskte yok.",
+                        evidence=[f"Silinen kisitli modlar: {', '.join(missing_restricted_mods)}"],
                         path=str(lf),
                     )
                 )

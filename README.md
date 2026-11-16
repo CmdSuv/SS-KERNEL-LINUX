@@ -59,7 +59,7 @@ mc-ss-forensics/
 ├── assets/                     # Uygulama simgesi ve UI görselleri
 ├── packaging/                  # 7 dağıtım için Containerfile/Dockerfile, build_inside_container.sh, doğrulayıcı
 ├── scripts/                    # Çoklu hedef container derleme yöneticisi (build_distro_targets.py)
-├── tests/                      # 80 birim ve entegrasyon testi
+├── tests/                      # 81 birim ve entegrasyon testi
 ├── launch_ss_sentinel.sh       # Terminal tabanlı hızlı başlatıcı
 ├── LICENSE                     # Zorunlu Atıf, Ticari Olmayan & Değişmez Lisans (+ kernel/ GPL-2.0 notu)
 └── README.md
