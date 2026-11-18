@@ -178,12 +178,13 @@ cat > "${OUT_DIR}/MC-SS-Sentinel.desktop" <<'DESK'
 Type=Application
 Name=MC SS Sentinel
 Comment=Linux Derin Adli Hile Kontrol Aracı (Ring-0 + 9 Katman)
-Exec=%h/.local/bin/MC-SS-Sentinel
+Exec=sh -c "p=\\"\\${1#file://}\\"; d=\\".\\"; if [ -n \\"\\$p\\" ]; then d=\\$(dirname \\"\\$p\\"); fi; desk=\\"\\"; command -v xdg-user-dir >/dev/null 2>&1 && desk=\\$(xdg-user-dir DESKTOP 2>/dev/null); for c in \\"\\$d/MC-SS-Sentinel\\" \\"\\$d/SS-Kontrol-Araclari/MC-SS-Sentinel\\" \\"\\$desk/SS-Kontrol-Araclari/MC-SS-Sentinel\\" \\"\\$desk/MC-SS-Sentinel\\" \\"\\$HOME/Desktop/SS-Kontrol-Araclari/MC-SS-Sentinel\\" \\"\\$HOME/Desktop/MC-SS-Sentinel\\" \\"\\$HOME/Masaüstü/SS-Kontrol-Araclari/MC-SS-Sentinel\\" \\"\\$HOME/Masaüstü/MC-SS-Sentinel\\" \\"\\$HOME/Downloads/MC-SS-Sentinel\\" \\"\\$HOME/İndirilenler/MC-SS-Sentinel\\" \\"\\$HOME/.local/bin/MC-SS-Sentinel\\"; do if [ -f \\"\\$c\\" ]; then [ -x \\"\\$c\\" ] || chmod +x \\"\\$c\\" 2>/dev/null || true; exec \\"\\$c\\"; fi; done; command -v MC-SS-Sentinel >/dev/null 2>&1 && exec MC-SS-Sentinel; msg=\\"MC-SS-Sentinel calistirilabilir dosyasi bulunamadi! Lutfen .desktop kisayolunun yanina MC-SS-Sentinel dosyasini da kopyalayin.\\"; (command -v zenity >/dev/null 2>&1 && zenity --error --text=\\"\\$msg\\") || (command -v kdialog >/dev/null 2>&1 && kdialog --error \\"\\$msg\\") || (command -v notify-send >/dev/null 2>&1 && notify-send \\"MC SS Sentinel\\" \\"\\$msg\\"); exit 1" sh %k
 Icon=mc-ss-sentinel
 Terminal=false
-Categories=System;Security;Utility;
+Categories=System;Security;
 StartupWMClass=MC-SS-Sentinel
 DESK
+chmod 0755 "${OUT_DIR}/MC-SS-Sentinel.desktop"
 
 cat > "${OUT_DIR}/install_target.sh" <<'INST'
 #!/usr/bin/env bash
@@ -192,8 +193,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "${HOME}/.local/bin" "${HOME}/.local/share/applications" "${HOME}/.local/share/icons/hicolor/256x256/apps"
 install -m 0755 "${HERE}/MC-SS-Sentinel" "${HOME}/.local/bin/MC-SS-Sentinel"
 install -m 0644 "${HERE}/mc_ss_sentinel.png" "${HOME}/.local/share/icons/hicolor/256x256/apps/mc-ss-sentinel.png"
-install -m 0644 "${HERE}/MC-SS-Sentinel.desktop" "${HOME}/.local/share/applications/MC-SS-Sentinel.desktop"
+install -m 0755 "${HERE}/MC-SS-Sentinel.desktop" "${HOME}/.local/share/applications/MC-SS-Sentinel.desktop"
 update-desktop-database "${HOME}/.local/share/applications" >/dev/null 2>&1 || true
+gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" >/dev/null 2>&1 || true
 echo "Kuruldu: ${HOME}/.local/bin/MC-SS-Sentinel"
 INST
 chmod 0755 "${OUT_DIR}/install_target.sh"

@@ -388,6 +388,10 @@ class TestTargetOsDialogAndPackagingRecipes(unittest.TestCase):
         for tid in targets:
             self.assertIn(f"targets/{tid}", cp.stdout)
 
+        build_sh = (repo / "packaging/build_inside_container.sh").read_text(encoding="utf-8")
+        self.assertNotIn("Exec=%h/", build_sh)
+        self.assertIn("%k", build_sh)
+
 
 if __name__ == "__main__":
     unittest.main()
