@@ -307,7 +307,13 @@ def _inspect_options_txt(ctx: ScanContext, label: str, opt_file: Path) -> None:
             ) or k_low.startswith("key_key.debug.light"):
                 continue
             strict, high_ctx, low_ctx = match_cheat_signatures(k_strip)
-            if strict or high_ctx or (len(low_ctx) >= 1 and any(x in k_low for x in ("reach", "velocity", "blink", "criticals", "scaffold"))):
+            rest_kb = match_restricted_utility_mods(k_strip)
+            if (
+                strict
+                or high_ctx
+                or any(x in ("gammautils", "gamma-utils", "fullbright", "fullbrightub") for x in rest_kb)
+                or (len(low_ctx) >= 1 and any(x in k_low for x in ("reach", "velocity", "blink", "criticals", "scaffold")))
+            ):
                 cheat_keybinds.append(f"{k_strip}:{v_strip}")
 
         elif k_low in ("resourcepacks", "incompatibleresourcepacks"):
@@ -333,8 +339,10 @@ def _inspect_options_txt(ctx: ScanContext, label: str, opt_file: Path) -> None:
     if cheat_keybinds:
         kb_blob = "\n".join(cheat_keybinds)
         s_kb, h_kb, l_kb = match_cheat_signatures(kb_blob)
-        only_gamma_kb = bool(s_kb or h_kb or l_kb) and all(
-            x in ("gammautils", "fullbright") for x in (s_kb + h_kb + l_kb)
+        r_kb = match_restricted_utility_mods(kb_blob)
+        only_gamma_kb = (not s_kb and not h_kb and not l_kb and bool(r_kb)) or (
+            bool(s_kb or h_kb or l_kb)
+            and all(x in ("gammautils", "fullbright") for x in (s_kb + h_kb + l_kb))
         )
         ctx.add_finding(
             Finding(
@@ -364,6 +372,7 @@ def _inspect_configs_and_launchers(ctx: ScanContext, label: str, inst_dir: Path)
             for entry in check_base.iterdir():
                 ename_low = entry.name.lower()
                 strict, high_ctx, _ = match_cheat_signatures(entry.name)
+                rest_cfg = match_restricted_utility_mods(entry.name)
                 if ename_low in CHEAT_FOLDER_NAMES or strict or high_ctx:
                     ctx.add_finding(
                         Finding(
@@ -375,6 +384,20 @@ def _inspect_configs_and_launchers(ctx: ScanContext, label: str, inst_dir: Path)
                             title=f"Minecraft konfigurasyonunda hile klasoru/dosyasi ({label}): {entry.name}",
                             description="mods/ klasoru temizlense bile hileye ait config/profil klasoru duruyor.",
                             evidence=[str(entry)],
+                            path=str(entry),
+                        )
+                    )
+                elif rest_cfg:
+                    ctx.add_finding(
+                        Finding(
+                            rule_id="E5-CHEAT-CONFIG-ARTIFACT",
+                            engine=ENGINE_NAME,
+                            severity=Severity.MEDIUM,
+                            confidence=Confidence.HIGH,
+                            category="Restricted Utility Config",
+                            title=f"Minecraft konfigurasyonunda kisitli utility mod ayari ({label}): {entry.name}",
+                            description="Sunucu kurallarina bagli olarak kisitlanabilen (Fullbright/Gamma/Utility) mod yapilandirma dosyasi.",
+                            evidence=[str(entry), f"Mod: {', '.join(rest_cfg)}"],
                             path=str(entry),
                         )
                     )

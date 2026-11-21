@@ -9,6 +9,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,11 @@ _KNOWN_SAFE_EBPF_NAMES = (
     "cilium",
     "kube",
     "restrict_files",
+    "restrict_fs",
+    "userns_restrict",
+    "restrict_userns",
+    "sd_fw_",
+    "sd_devices",
     "bind_v4",
     "bind_v6",
     "sock_addr",
@@ -600,7 +606,25 @@ def _analyze_ring0_tasks_and_vmas(ctx: ScanContext, tasks_txt: str) -> None:
         ring0_tgids = {int(t["tgid"]) for t in tasks if t.get("tgid", "").isdigit()}
         proc_dirs: set[int] = set()
         snap = ctx.kernel_snapshot_data or {}
-        lkm_pids = (snap.get("root_extras") or {}).get("proc_pids_at_lkm")
+        root_ex = snap.get("root_extras") if isinstance(snap.get("root_extras"), dict) else {}
+        lkm_pids = root_ex.get("proc_pids_at_lkm")
+        self_pids: set[int] = {os.getpid(), os.getppid()}
+        for sp in (root_ex.get("sentinel_self_pids") or []):
+            if isinstance(sp, int):
+                self_pids.add(sp)
+        self_meipasses: list[str] = [
+            str(m).rstrip("/") for m in (root_ex.get("sentinel_self_meipasses") or []) if m
+        ]
+        local_mei = str(getattr(sys, "_MEIPASS", "") or "").rstrip("/")
+        if local_mei and local_mei not in self_meipasses:
+            self_meipasses.append(local_mei)
+        self_exe_norm = str(root_ex.get("sentinel_self_exe") or "").strip()
+        if not self_exe_norm and getattr(sys, "frozen", False):
+            try:
+                self_exe_norm = str(Path(sys.executable).resolve())
+            except OSError:
+                self_exe_norm = str(sys.executable)
+
         if isinstance(lkm_pids, list):
             for x in lkm_pids:
                 if isinstance(x, int):
@@ -613,17 +637,41 @@ def _analyze_ring0_tasks_and_vmas(ctx: ScanContext, tasks_txt: str) -> None:
             pass
 
         missing_from_proc = sorted(ring0_tgids - proc_dirs) if proc_dirs else []
-        # Filter ultra-short kernel helper threads; verify if PID exists via task record not transient
+        # Filter short-lived helper/self processes & verify liveness (kill(pid,0) != ESRCH on live host)
+        # so exited transient processes never false-positive as Ring-0 hidden rootkits.
         real_hidden: list[str] = []
         if missing_from_proc:
             by_tgid = {int(t["tgid"]): t for t in tasks if t.get("tgid", "").isdigit()}
             for mpid in missing_from_proc:
-                # Re-stat single /proc/<pid> to guard race conditions cleanly
+                if mpid in self_pids:
+                    continue
                 if not (ctx.proc_root / str(mpid)).exists():
                     info = by_tgid.get(mpid, {})
                     comm = info.get("comm", "")
-                    if comm and comm not in ("kworker", "sh", "true"):
-                        real_hidden.append(f"TGID={mpid} comm={comm} exe={info.get('exe', '')}")
+                    exe = str(info.get("exe", "") or "")
+                    ppid_s = str(info.get("ppid", "") or "")
+                    ppid_i = int(ppid_s) if ppid_s.isdigit() else -1
+                    # Exclude verified self Sentinel helper children (pkexec/PyInstaller bootloader fork)
+                    if self_exe_norm and exe and (
+                        exe == self_exe_norm
+                        or (os.path.exists(exe) and os.path.exists(self_exe_norm) and os.path.samefile(exe, self_exe_norm))
+                    ):
+                        continue
+                    if ppid_i in self_pids and comm in ("MC-SS-Sentinel", "ss_kernel_probe", "pkexec", "insmod", "rmmod"):
+                        continue
+                    # On live host, a real hidden PID is STILL ALIVE in kernel (kill(mpid,0) succeeds or returns EPERM);
+                    # if kill(mpid,0) raises ProcessLookupError (ESRCH), the process simply exited between snapshots (TOCTOU).
+                    if ctx.live_mode and ctx.proc_root == Path("/proc"):
+                        try:
+                            os.kill(mpid, 0)
+                        except ProcessLookupError:
+                            continue
+                        except PermissionError:
+                            pass
+                        except OSError:
+                            pass
+                    if comm and comm not in ("kworker", "sh", "true", "insmod", "rmmod"):
+                        real_hidden.append(f"TGID={mpid} comm={comm} exe={exe}")
 
         if real_hidden:
             ctx.add_finding(
@@ -660,6 +708,24 @@ def _analyze_ring0_tasks_and_vmas(ctx: ScanContext, tasks_txt: str) -> None:
                     )
                 )
 
+    # Collect verified self Sentinel identity for VMA filtering (even when tasks list is empty)
+    _vma_snap = ctx.kernel_snapshot_data or {}
+    _vma_rext = _vma_snap.get("root_extras") if isinstance(_vma_snap.get("root_extras"), dict) else {}
+    _vma_self_pids: set[int] = {os.getpid(), os.getppid()}
+    for _sp in (_vma_rext.get("sentinel_self_pids") or []):
+        if isinstance(_sp, int):
+            _vma_self_pids.add(_sp)
+    _vma_self_meis: list[str] = [
+        str(m).rstrip("/") for m in (_vma_rext.get("sentinel_self_meipasses") or []) if m
+    ]
+    _local_vma_mei = str(getattr(sys, "_MEIPASS", "") or "").rstrip("/")
+    if _local_vma_mei and _local_vma_mei not in _vma_self_meis:
+        _vma_self_meis.append(_local_vma_mei)
+    _vma_self_exe = str(_vma_rext.get("sentinel_self_exe") or "").strip()
+    _tasks_by_pid: dict[int, dict[str, str]] = {
+        int(t["tgid"]): t for t in tasks if t.get("tgid", "").isdigit()
+    }
+
     # Byte-level VMA & access_process_vm findings
     for va in vma_anoms:
         pid = int(va["pid"]) if va.get("pid", "").isdigit() else None
@@ -669,12 +735,40 @@ def _analyze_ring0_tasks_and_vmas(ctx: ScanContext, tasks_txt: str) -> None:
         jni_hits = int(va.get("jni_hits", "0") or 0)
         vfile = va.get("file", "")
         vfile_low = vfile.lower()
+        is_anon = va.get("anon") == "1"
         is_memfd = va.get("memfd") == "1" or vfile_low.startswith("/memfd:")
         is_shm = va.get("shm") == "1" or vfile_low.startswith(("/dev/shm/", "/tmp/", "/var/tmp/"))
         is_del = va.get("del") == "1" or "(deleted)" in vfile_low
         is_rwx = va.get("rwx") == "1"
 
-        if elf and (va.get("anon") == "1" or is_memfd or is_shm or is_del):
+        # Skip verified MC-SS-Sentinel PyInstaller _MEIPASS runtime shared libraries (r-xp on tmpfs)
+        is_self_vma = False
+        if vfile and not is_rwx and not is_del and not is_memfd and not is_anon:
+            if any(vfile == mp or vfile.startswith(mp + "/") for mp in _vma_self_meis):
+                is_self_vma = True
+            elif pid in _vma_self_pids and "/_mei" in vfile_low and vfile_low.startswith("/tmp/"):
+                is_self_vma = True
+            elif pid is not None and _vma_self_exe and "/_mei" in vfile_low and vfile_low.startswith("/tmp/"):
+                tinfo = _tasks_by_pid.get(pid, {})
+                texe = str(tinfo.get("exe", "") or "")
+                if texe == _vma_self_exe:
+                    is_self_vma = True
+            elif vfile_low.startswith("/tmp/.mount_"):
+                # Standard AppImage FUSE mount shared libraries
+                is_self_vma = True
+        if is_self_vma:
+            continue
+
+        # File-backed non-RWX /tmp libraries on tmpfs are only suspicious for Java/Minecraft/Wine or /dev/shm
+        shm_suspicious = is_shm and (
+            is_rwx
+            or is_del
+            or vfile_low.startswith("/dev/shm/")
+            or not vfile
+            or any(g in comm.lower() for g in ("java", "javaw", "wine", "proton", "minecraft", "lunar"))
+        )
+
+        if elf and (is_anon or is_memfd or is_del or shm_suspicious):
             ctx.add_finding(
                 Finding(
                     rule_id="E9-KERNEL-VMA-REFLECTIVE-ELF",
@@ -692,7 +786,7 @@ def _analyze_ring0_tasks_and_vmas(ctx: ScanContext, tasks_txt: str) -> None:
                     ],
                 )
             )
-        if jni_hits > 0 and (va.get("anon") == "1" or is_memfd or is_shm or is_del):
+        if jni_hits > 0 and (is_anon or is_memfd or is_del or shm_suspicious):
             try:
                 jmask = int(va.get("jni_mask", "0") or "0", 16)
             except ValueError:
@@ -1242,7 +1336,13 @@ def _analyze_ebpf_and_pid_cross(
                 "kprobe_multi(" in lt or "tracing_multi(" in lt for lt in all_targets
             )
 
-            if any(low.startswith(safe) for safe in _KNOWN_SAFE_EBPF_NAMES) and not has_sensitive_target:
+            _is_safe_lsm = (
+                ptype in ("LSM", "CGROUP_DEVICE", "CGROUP_SKB", "CGROUP_SOCK_ADDR")
+                and int(pr.get("uid", -1) or 0) == 0
+                and low.startswith(("userns_restrict", "restrict_fs", "restrict_userns", "sd_fw_", "sd_devices"))
+                and not has_sensitive_target
+            )
+            if (_is_safe_lsm or (any(low.startswith(safe) for safe in _KNOWN_SAFE_EBPF_NAMES) and ptype != "KPROBE" and not has_sensitive_target)):
                 continue
             # Flag unnamed progs, sensitive-target hooks, rootkit keywords, multi-kprobes,
             # or unattributed high-risk KPROBE/TRACING/LSM/RAW_TRACEPOINT hooks

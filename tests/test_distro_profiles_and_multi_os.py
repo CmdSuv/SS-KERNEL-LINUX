@@ -59,12 +59,12 @@ class TestDistroDetectionAndProfiles(unittest.TestCase):
             )
             self.assertEqual("ubuntu_24_04", det_u24.target_id)
 
-            det_mint21 = detect_host_distro(
+            det_u22 = detect_host_distro(
                 root_prefix=root,
-                os_release_text='ID=linuxmint\nID_LIKE="ubuntu debian"\nVERSION_ID="21.3"\nUBUNTU_CODENAME=jammy\nPRETTY_NAME="Linux Mint 21.3"\n',
+                os_release_text='ID=ubuntu\nVERSION_ID="22.04"\nVERSION_CODENAME=jammy\nPRETTY_NAME="Ubuntu 22.04.5 LTS"\n',
                 kernel_release="5.15.0-125-generic",
             )
-            self.assertEqual("ubuntu_22_04", det_mint21.target_id)
+            self.assertEqual("ubuntu_22_04", det_u22.target_id)
 
             det_deb = detect_host_distro(
                 root_prefix=root,
@@ -362,10 +362,11 @@ class TestTargetOsDialogAndPackagingRecipes(unittest.TestCase):
                 win.close()
 
             self.assertEqual([True], finished_ok)
-            txts = list(desktop.glob("MC_SS_Raporu_*.txt"))
-            self.assertEqual(1, len(txts))
-            report_txt = txts[0].read_text(encoding="utf-8")
-            self.assertIn("Ubuntu 24.04", report_txt)
+            htmls = list(desktop.glob("MC_SS_Raporu_*.html"))
+            self.assertEqual(1, len(htmls))
+            report_html = htmls[0].read_text(encoding="utf-8")
+            self.assertIn("<!DOCTYPE html>", report_html)
+            self.assertIn("Ubuntu 24.04", report_html)
 
     def test_packaging_recipes_and_dry_run_builder(self) -> None:
         repo = Path(__file__).resolve().parent.parent

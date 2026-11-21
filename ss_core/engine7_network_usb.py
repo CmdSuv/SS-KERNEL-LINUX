@@ -99,12 +99,27 @@ def _build_inode_to_proc_map(ctx: ScanContext) -> dict[str, tuple[int, str]]:
     return mapping
 
 
+_DPI_BYPASS_PROCS: tuple[str, ...] = (
+    "ciadpi",
+    "byedpi",
+    "goodbyedpi",
+    "zapret",
+    "tpws",
+    "nfqws",
+    "spoofdpi",
+)
+
+
 def _check_proc_net_sockets(ctx: ScanContext) -> None:
     inode_map = _build_inode_to_proc_map(ctx)
     proxy_hits: list[str] = []
+    dpi_only_hits: list[str] = []
+    game_on_proxy = False
+    dpi_ports: set[int] = set()
     cheat_gui_hits: list[str] = []
     java_conns: list[str] = []
 
+    parsed_rows: list[tuple[str, int, str, int, str, tuple[int, str] | None]] = []
     for fname, ipv6 in (("net/tcp", False), ("net/tcp6", True)):
         txt = safe_read_text(ctx.proc_root / fname, 2 * 1024 * 1024)
         if not txt:
@@ -129,27 +144,44 @@ def _check_proc_net_sockets(ctx: ScanContext) -> None:
             r_ip = _decode_proc_ip(r_ip_hex, ipv6)
             state = TCP_STATES.get(st_hex.upper(), st_hex)
             owner = inode_map.get(inode)
-            owner_str = f"PID {owner[0]} ({owner[1]})" if owner else "bilinmeyen PID"
+            parsed_rows.append((l_ip, l_port, r_ip, r_port, state, owner))
+            if state == "LISTEN" and l_port in SUSPICIOUS_PROXY_PORTS and owner:
+                if any(d in owner[1].lower() for d in _DPI_BYPASS_PROCS):
+                    dpi_ports.add(l_port)
 
-            if state == "LISTEN" and l_port in SUSPICIOUS_PROXY_PORTS:
-                proxy_hits.append(f"{l_ip}:{l_port} [{SUSPICIOUS_PROXY_PORTS[l_port]}] -> {owner_str}")
+    for l_ip, l_port, r_ip, r_port, state, owner in parsed_rows:
+        owner_str = f"PID {owner[0]} ({owner[1]})" if owner else "bilinmeyen PID"
+        owner_low = owner[1].lower() if owner else ""
 
-            if state == "LISTEN" and l_port in CHEAT_WEBGUI_PORTS:
-                cheat_gui_hits.append(f"{l_ip}:{l_port} (LISTEN) -> {owner_str}")
+        if state == "LISTEN" and l_port in SUSPICIOUS_PROXY_PORTS:
+            rec = f"{l_ip}:{l_port} [{SUSPICIOUS_PROXY_PORTS[l_port]}] -> {owner_str}"
+            if l_port in dpi_ports:
+                dpi_only_hits.append(rec)
+            else:
+                proxy_hits.append(rec)
 
-            if state == "ESTABLISHED":
-                owner_low = owner[1].lower() if owner else ""
-                is_java_or_game = any(t in owner_low for t in ("java", "javaw", "wine", "proton", "minecraft", "lunar", "prism"))
+        if state == "LISTEN" and l_port in CHEAT_WEBGUI_PORTS:
+            cheat_gui_hits.append(f"{l_ip}:{l_port} (LISTEN) -> {owner_str}")
+
+        if state == "ESTABLISHED":
+            is_java_or_game = any(t in owner_low for t in ("java", "javaw", "wine", "proton", "minecraft", "lunar", "prism"))
+            if is_java_or_game:
+                java_conns.append(f"{owner_str}: {l_ip}:{l_port} -> {r_ip}:{r_port}")
+            if r_port in SUSPICIOUS_PROXY_PORTS:
+                is_browser_or_chat = any(
+                    b in owner_low for b in ("opera", "firefox", "chrome", "chromium", "brave", "vivaldi", "edge", "discord", "vesktop", "telegram")
+                )
                 if is_java_or_game:
-                    java_conns.append(f"{owner_str}: {l_ip}:{l_port} -> {r_ip}:{r_port}")
-                if r_port in SUSPICIOUS_PROXY_PORTS:
-                    is_browser = any(b in owner_low for b in ("opera", "firefox", "chrome", "chromium", "brave", "vivaldi", "edge"))
-                    if is_java_or_game or (r_ip in ("127.0.0.1", "::1") and not is_browser):
-                        proxy_hits.append(f"Surec yerel/supheli proxy portuna bagli: {r_ip}:{r_port} ({owner_str})")
+                    game_on_proxy = True
+                    proxy_hits.append(f"Oyun/Java sureci yerel proxy portuna bagli: {r_ip}:{r_port} ({owner_str})")
+                elif r_ip in ("127.0.0.1", "::1") and not is_browser_or_chat:
+                    proxy_hits.append(f"Surec yerel/supheli proxy portuna bagli: {r_ip}:{r_port} ({owner_str})")
+                elif r_port in dpi_ports and is_browser_or_chat:
+                    dpi_only_hits.append(f"Sohbet/Tarayici DPI proxy baglantisi: {r_ip}:{r_port} ({owner_str})")
 
     ctx.telemetry["java_established_sockets"] = java_conns[:30]
 
-    if proxy_hits:
+    if proxy_hits or game_on_proxy:
         ctx.add_finding(
             Finding(
                 rule_id="E7-LOCAL-PROXY-ACTIVE",
@@ -159,7 +191,20 @@ def _check_proc_net_sockets(ctx: ScanContext) -> None:
                 category="Proxy / Tunnel",
                 title="Yerel SOCKS/HTTP proxy veya tunel portu aktif",
                 description="Oyun veya sistem trafigi yerel proxy/tunel uzerinden yonlendiriliyor olabilir.",
-                evidence=proxy_hits[:12],
+                evidence=(proxy_hits + dpi_only_hits)[:12],
+            )
+        )
+    elif dpi_only_hits:
+        ctx.add_finding(
+            Finding(
+                rule_id="E7-LOCAL-PROXY-ACTIVE",
+                engine=ENGINE_NAME,
+                severity=Severity.LOW,
+                confidence=Confidence.MEDIUM,
+                category="DPI Bypass Proxy (Discord/Browser)",
+                title="Yerel DPI/sansur asma proxy'si aktif (yalnizca sohbet/tarayici bagli)",
+                description="ciadpi/byedpi benzeri yerel DPI araci aktif ancak Java/Minecraft sureci bu proxy'ye bagli degil.",
+                evidence=dpi_only_hits[:12],
             )
         )
     if cheat_gui_hits:

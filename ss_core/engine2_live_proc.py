@@ -81,6 +81,16 @@ BENIGN_DELETED_MAP_HINTS: tuple[str, ...] = (
     "browsermetrics",
     "quotamanager",
     "/run/user/",
+    "/.config/dconf/",
+    "/dconf/user",
+    "/fontconfig/",
+    "mesa_shader_cache",
+    "nvidia/glcache",
+    "qtshadercache",
+    "/.local/share/mime/",
+    "/var/lib/sss/mc/",
+    "/run/udev/",
+    "/.cache/",
 )
 
 # Exact benign executable memfd prefixes (never use bare substring "jit"!)
@@ -150,8 +160,46 @@ LEGIT_JIT_COMMS: frozenset[str] = frozenset(
         "privileged cont",
         "rdd process",
         "utility process",
+        "xdg-desktop-por",
+        "at-spi-bus-laun",
+        "bazaar",
+        "krunner",
+        "ksmserver",
+        "polkit-kde-auth",
+        "baloo_file",
     }
 )
+
+_SYSTEM_CATALOG_APP_COMMS: frozenset[str] = frozenset(
+    {
+        "bazaar",
+        "gnome-software",
+        "plasma-discover",
+        "discover",
+        "pamac-manager",
+        "octopi",
+    }
+)
+
+
+def _is_trusted_system_catalog_app(proc: ProcInfo) -> bool:
+    if proc.is_java or proc.is_minecraft or proc.is_wine:
+        return False
+    if proc.comm.lower() not in _SYSTEM_CATALOG_APP_COMMS:
+        return False
+    exe_low = proc.exe.lower()
+    return exe_low.startswith(("/usr/bin/", "/usr/libexec/", "/app/bin/"))
+
+
+def _is_trusted_build_or_ide_jvm(proc: ProcInfo) -> bool:
+    """Verified non-Minecraft Gradle build daemon (prevents scanning JUnit anti-cheat test reports in Gradle heap)."""
+    if proc.is_minecraft or proc.is_suspicious or proc.is_wine:
+        return False
+    cmd_low = proc.cmdline_str.lower()
+    return (
+        "org.gradle.launcher.daemon.bootstrap.gradledaemon" in cmd_low
+        and ("/.gradle/wrapper/dists/gradle-" in cmd_low or "/gradle-daemon-" in cmd_low)
+    )
 
 # Precompiled lowercase byte patterns for ultra-fast chunked RAM scanning (ASCII + UTF-16LE)
 _RAM_STRICT_BOUNDED_TERMS: tuple[bytes, ...] = (
@@ -309,7 +357,9 @@ def _is_benign_deleted_map(path_part: str, perms: str = "") -> bool:
         if "/tmp/hsperfdata_" in low:
             return True
         return False
-    if any(h in low for h in BENIGN_DELETED_MAP_HINTS):
+    if any(low.startswith(p) for p in BENIGN_EXEC_MEMFD_PREFIXES):
+        return True
+    if any(h in low for h in BENIGN_DELETED_MAP_HINTS) and "x" not in perms:
         return True
     if "x" not in perms and (
         low.startswith(("/memfd:", "/dev/shm/")) or "/cache/" in low or "/mesa_shader_cache" in low
@@ -324,9 +374,32 @@ def _is_benign_preload(val: str, proc: ProcInfo) -> bool:
     tokens = [tok.strip() for tok in re.split(r"[:\s]+", val.strip()) if tok.strip()]
     if not tokens:
         return False
-    is_target = proc.is_java or proc.is_minecraft
+    is_target = proc.is_java or proc.is_minecraft or proc.is_wine
+    exe_low = proc.exe.lower()
     for tok in tokens:
         tlow = tok.lower()
+        # Official Mozilla Firefox / Thunderbird seccomp sandbox preload on verified browser binaries
+        if (
+            not is_target
+            and tlow in (
+                "libmozsandbox.so",
+                "/app/lib/firefox/libmozsandbox.so",
+                "/usr/lib64/firefox/libmozsandbox.so",
+                "/usr/lib/firefox/libmozsandbox.so",
+                "/app/lib/thunderbird/libmozsandbox.so",
+                "/usr/lib64/thunderbird/libmozsandbox.so",
+            )
+            and exe_low.startswith(
+                (
+                    "/app/lib/firefox/",
+                    "/usr/lib64/firefox/",
+                    "/usr/lib/firefox/",
+                    "/app/lib/thunderbird/",
+                    "/usr/lib64/thunderbird/",
+                )
+            )
+        ):
+            continue
         if not any(h in tlow for h in BENIGN_PRELOAD_HINTS):
             return False
         # Require trusted system/Flatpak/pressure-vessel location (prevent fake /tmp/libgamemodeauto.so)
@@ -705,18 +778,30 @@ def _inspect_process_metadata(
 
             if alow.startswith(("-javaagent:", "-agentpath:")):
                 agent_target = arg.split(":", 1)[1].split("=", 1)[0]
-                is_known_lunar = ".lunarclient" in agent_target.lower() and "ichor" in agent_target.lower()
+                at_low = agent_target.lower()
+                is_known_lunar = ".lunarclient" in at_low and "ichor" in at_low
+                is_known_gradle = (
+                    not proc.is_minecraft
+                    and "/.gradle/wrapper/dists/gradle-" in at_low
+                    and "/lib/agents/gradle-instrumentation-agent-" in at_low
+                    and "org.gradle.launcher.daemon" in proc.cmdline_str.lower()
+                )
+                is_benign_agent = is_known_lunar or is_known_gradle
                 ctx.add_finding(
                     Finding(
                         rule_id="E2-JVM-AGENT-ARG",
                         engine=ENGINE_NAME,
-                        severity=Severity.INFO if is_known_lunar else Severity.CRITICAL,
+                        severity=Severity.INFO if is_benign_agent else Severity.CRITICAL,
                         confidence=Confidence.CONFIRMED,
                         category="JVM Agent Injection",
                         title=(
                             f"Lunar Ichor agent tespit edildi (PID {proc.pid})"
                             if is_known_lunar
-                            else f"Java surecinde enjeksiyon agent parametresi tespit edildi (PID {proc.pid})"
+                            else (
+                                f"Gradle Daemon instrumentation agent tespit edildi (PID {proc.pid})"
+                                if is_known_gradle
+                                else f"Java surecinde enjeksiyon agent parametresi tespit edildi (PID {proc.pid})"
+                            )
                         ),
                         description="JVM baslangicinda bytecode degistirebilen -javaagent/-agentpath kullanilmis.",
                         evidence=[f"Arguman: {arg}"],
@@ -725,7 +810,7 @@ def _inspect_process_metadata(
                         recommendation="Belirtilen .jar/.so dosyasini Engine 4 veya JADX ile mutlaka inceleyin.",
                     )
                 )
-                if not is_known_lunar:
+                if not is_benign_agent:
                     proc.is_suspicious = True
             elif alow.startswith(("-xbootclasspath/a:", "-xbootclasspath/p:")):
                 ctx.add_finding(
@@ -905,6 +990,9 @@ def _inspect_maps_and_fds(ctx: ScanContext, proc: ProcInfo) -> list[tuple[int, i
 
     seen_deleted: set[str] = set()
     seen_cheat: set[str] = set()
+    has_legit_jit_runtime = False
+    exe_low = proc.exe.lower()
+    exe_not_ephemeral = not exe_low.startswith(("/tmp/", "/dev/shm/", "/var/tmp/")) or exe_low.startswith("/tmp/.mount_")
     for line in maps_text.splitlines():
         parts = line.split(None, 5)
         if len(parts) < 5:
@@ -928,6 +1016,24 @@ def _inspect_maps_and_fds(ctx: ScanContext, proc: ProcInfo) -> list[tuple[int, i
                 proc.is_java = True
             if "liblwjgl" in low_p or "/.minecraft/" in low_p or "/.lunarclient/" in low_p:
                 proc.is_minecraft = True
+            if exe_not_ephemeral and any(
+                jm in low_p
+                for jm in (
+                    "libqt6qml",
+                    "libqt5qml",
+                    "libqt6webengine",
+                    "libqt5webengine",
+                    "libwebkit2gtk",
+                    "libjavascriptcoregtk",
+                    "v8_context_snapshot",
+                    "icudtl.dat",
+                    "app.asar",
+                    "libcef.so",
+                    "libmozjs",
+                    "libluajit",
+                )
+            ):
+                has_legit_jit_runtime = True
             if "(deleted)" in low_p and pathname not in seen_deleted:
                 seen_deleted.add(pathname)
                 if not _is_benign_deleted_map(pathname, perms):
@@ -1026,7 +1132,13 @@ def _inspect_maps_and_fds(ctx: ScanContext, proc: ProcInfo) -> list[tuple[int, i
             )
         )
         proc.is_suspicious = True
-    if len(anon_rwx) >= 2 and not proc.is_java and not proc.is_wine and not _is_legit_jit_process(proc):
+    if (
+        len(anon_rwx) >= 2
+        and not proc.is_java
+        and not proc.is_wine
+        and not has_legit_jit_runtime
+        and not _is_legit_jit_process(proc)
+    ):
         ctx.add_finding(
             Finding(
                 rule_id="E2-MAP-ANON-RWX",
@@ -1196,6 +1308,8 @@ def _scan_region_bytes(
     strict_hits: dict[str, list[str]],
     cluster_hits: list[str],
     reflective_elf_hits: list[str],
+    perms: str = "rwxp",
+    is_wine: bool = False,
 ) -> None:
     if not data:
         return
@@ -1258,8 +1372,8 @@ def _scan_region_bytes(
                         f"0x{base_addr + bidx * win:x} ({pathname or 'anon'}): [{', '.join(terms_sorted)}]"
                     )
 
-    # 3. Reflective ELF header inside anonymous memory
-    if not pathname and len(reflective_elf_hits) < 5:
+    # 3. Reflective ELF header inside anonymous memory (require executable permissions on Wine/heap where .so headers are buffered in rw-p)
+    if not pathname and ("x" in perms or not is_wine) and len(reflective_elf_hits) < 5:
         pos = 0
         while len(reflective_elf_hits) < 5:
             idx = data.find(b"\x7fELF", pos)
@@ -1395,6 +1509,8 @@ def _scan_process_memory(
                     strict_hits,
                     cluster_hits,
                     reflective_elf_hits,
+                    perms=perms,
+                    is_wine=proc.is_wine,
                 )
                 prev_tail = buf[-overlap:] if len(buf) >= overlap else buf
                 offset += len(buf)
@@ -1469,31 +1585,40 @@ def _inspect_hsperfdata_and_jcmd(ctx: ScanContext, java_procs: list[ProcInfo]) -
                     strict, high_ctx, _ = match_cheat_signatures(joined)
                     jlow = joined.lower()
                     if strict or high_ctx or "-javaagent" in jlow or "-agentpath" in jlow:
-                        ev = [
-                            ln[:200]
+                        raw_lines = [
+                            ln
                             for ln in joined.splitlines()
                             if any(k in ln.lower() for k in ("-javaagent", "-agentpath", *strict, *high_ctx))
                         ]
-                        is_lunar_only = (
-                            bool(ev)
+                        ev = [ln[:200] for ln in raw_lines]
+                        is_benign_hsperf = (
+                            bool(raw_lines)
                             and not strict
                             and not high_ctx
                             and "-agentpath" not in jlow
                             and "disableattachmechanism" not in jlow
                             and "perfdisablesharedmem" not in jlow
                             and "-xbootclasspath" not in jlow
-                            and all(".lunarclient" in ln.lower() and "ichor" in ln.lower() for ln in ev)
+                            and all(
+                                (".lunarclient" in ln.lower() and "ichor" in ln.lower())
+                                or (
+                                    "/.gradle/wrapper/dists/gradle-" in ln.lower()
+                                    and "/lib/agents/gradle-instrumentation-agent-" in ln.lower()
+                                    and "org.gradle.launcher.daemon" in jlow
+                                )
+                                for ln in raw_lines
+                            )
                         )
                         ctx.add_finding(
                             Finding(
                                 rule_id="E2-HSPERF-SUSPICIOUS",
                                 engine=ENGINE_NAME,
-                                severity=Severity.INFO if is_lunar_only else (Severity.CRITICAL if strict else Severity.HIGH),
+                                severity=Severity.INFO if is_benign_hsperf else (Severity.CRITICAL if strict else Severity.HIGH),
                                 confidence=Confidence.HIGH,
                                 category="JVM PerfData Trace",
                                 title=(
-                                    f"hsperfdata Lunar Ichor agent izi: {perf_file.name}"
-                                    if is_lunar_only
+                                    f"hsperfdata Lunar/Gradle resmi agent izi: {perf_file.name}"
+                                    if is_benign_hsperf
                                     else f"hsperfdata JVM belleginde supheli arguman/iz: {perf_file.name}"
                                 ),
                                 description="Java HotSpot performans verisi icinde agent veya hile parametresi bulundu.",
@@ -1560,7 +1685,15 @@ def _inspect_hsperfdata_and_jcmd(ctx: ScanContext, java_procs: list[ProcInfo]) -
                                         "-xbootclasspath",
                                     )
                                 )
-                                and all(".lunarclient" in ln.lower() and "ichor" in ln.lower() for ln in lines)
+                                and (
+                                    all(".lunarclient" in ln.lower() and "ichor" in ln.lower() for ln in lines)
+                                    or (
+                                        not proc.is_minecraft
+                                        and "/.gradle/wrapper/dists/gradle-" in low2
+                                        and "/lib/agents/gradle-instrumentation-agent-" in low2
+                                        and "org.gradle.launcher.daemon" in proc.cmdline_str.lower()
+                                    )
+                                )
                             )
                             ctx.add_finding(
                                 Finding(
@@ -1620,7 +1753,7 @@ def _inspect_hsperfdata_and_jcmd(ctx: ScanContext, java_procs: list[ProcInfo]) -
                             pid=proc.pid,
                         )
                     )
-                if attach_classes:
+                if attach_classes and not _is_trusted_build_or_ide_jvm(proc):
                     ctx.add_finding(
                         Finding(
                             rule_id="E2-JCMD-ATTACH-LOADED",
@@ -1802,12 +1935,16 @@ def run(ctx: ScanContext) -> None:
             [
                 proc
                 for proc in procs
-                if proc.is_suspicious
-                or ((proc.is_minecraft or proc.is_java or proc.is_wine) and not _is_electron_helper(proc))
+                if (
+                    proc.is_suspicious
+                    or ((proc.is_minecraft or proc.is_java or proc.is_wine) and not _is_electron_helper(proc))
+                )
+                and not _is_trusted_system_catalog_app(proc)
+                and not _is_trusted_build_or_ide_jvm(proc)
             ],
             key=lambda p: (
-                0 if (p.is_minecraft or p.is_suspicious) else (1 if p.is_java else 2),
-                p.pid,
+                0 if p.is_suspicious else (1 if p.is_minecraft else (2 if p.is_java else 3)),
+                -p.pid if p.is_suspicious else p.pid,
             ),
         )
         n_mem = max(1, len(mem_targets))

@@ -302,6 +302,17 @@ def _check_trash(ctx: ScanContext) -> None:
         )
 
 
+def _norm_url_key(url: str) -> str:
+    """Canonicalize URL (strip scheme, www, query params, and trailing SQLite varint noise) for active-vs-deleted dedup."""
+    u = (url or "").strip().lower()
+    if not u:
+        return ""
+    u = re.sub(r"^https?://(?:www\.)?", "", u)
+    u = u.split("?", 1)[0].split("#", 1)[0]
+    u = u.rstrip("/&%$'\")];,.")
+    return u
+
+
 def _carve_raw_sqlite_urls(db_and_wal_paths: list[Path]) -> list[str]:
     """Carve deleted URLs directly from raw SQLite pages & WAL frames (chunked up to 128MB)."""
     hits: set[str] = set()
@@ -323,13 +334,17 @@ def _carve_raw_sqlite_urls(db_and_wal_paths: list[Path]) -> list[str]:
                     buf = tail + chunk
                     for m in url_re.finditer(buf):
                         u = m.group(0).decode("ascii", errors="replace")
+                        # Split back-to-back concatenated SQLite TEXT columns (e.g. url + referrer 'https://a.com/https://a.com/')
+                        sub_m = re.search(r"(?<![=&?])https?://", u[8:])
+                        if sub_m:
+                            u = u[: 8 + sub_m.start()]
                         ulow = u.lower()
                         s, h_ctx, _ = match_cheat_signatures(u)
                         if any(dom in ulow for dom in CHEAT_DOMAINS) or s or len(h_ctx) >= 2:
                             hits.add(u)
                         elif ("minecraft" in ulow and bool(h_ctx)) or (
                             any(uhost in ulow for uhost in SUSPICIOUS_UNVERIFIED_MOD_ORIGINS)
-                            and any(ext in ulow for ext in (".jar", ".so", ".exe", ".dll", "cheat", "click", "xray"))
+                            and any(kw in ulow for kw in ("cheat", "click", "xray", "vape", "wurst", "meteor", "killaura", "inject"))
                         ):
                             hits.add(u)
                     tail = buf[-512:] if len(buf) >= 512 else buf
@@ -367,6 +382,8 @@ def _check_browsers(ctx: ScanContext) -> None:
             conn: sqlite3.Connection | None = None
             url_hits: list[str] = []
             dl_hits: list[str] = []
+            unverified_dl_hits: list[str] = []
+            active_url_keys: set[str] = set()
             total_urls = 0
             recent_count = 0
             sql_ok = False
@@ -390,6 +407,10 @@ def _check_browsers(ctx: ScanContext) -> None:
                             break
                         rows_checked += len(batch)
                         for url, title, lvt in batch:
+                            if url:
+                                active_url_keys.add(_norm_url_key(url))
+                                if title and title.strip():
+                                    active_url_keys.add(_norm_url_key(f"{url}{title.strip().split()[0]}"))
                             u_s = f"{url or ''} {title or ''}"
                             ulow = u_s.lower()
                             s, h_ctx, _ = match_cheat_signatures(u_s)
@@ -426,17 +447,27 @@ def _check_browsers(ctx: ScanContext) -> None:
                         except sqlite3.Error:
                             cur.execute("SELECT NULL, '', NULL, 0 WHERE 0")
                     for tab_url, chain_url, target_path, st_time in cur.fetchall():
+                        if tab_url:
+                            active_url_keys.add(_norm_url_key(tab_url))
+                        if chain_url:
+                            active_url_keys.add(_norm_url_key(chain_url))
                         combo = f"{tab_url or ''} {chain_url or ''} {target_path or ''}"
                         clow = combo.lower()
                         s, h_ctx, _ = match_cheat_signatures(combo)
-                        is_susp_dl = any(dom in clow for dom in CHEAT_DOMAINS) or s or h_ctx or (
-                            any(h in clow for h in SUSPICIOUS_UNVERIFIED_MOD_ORIGINS)
+                        is_cheat_dl = bool(any(dom in clow for dom in CHEAT_DOMAINS) or s or h_ctx)
+                        is_unverified_dl = (
+                            not is_cheat_dl
+                            and any(h in clow for h in SUSPICIOUS_UNVERIFIED_MOD_ORIGINS)
                             and any(ext in clow for ext in (".jar", ".so", ".exe", ".dll"))
                         )
-                        if is_susp_dl:
+                        if is_cheat_dl or is_unverified_dl:
                             t_unix = (st_time / 1_000_000) - WEBKIT_EPOCH_OFFSET_SEC if st_time else 0
                             src_url = chain_url or tab_url
-                            dl_hits.append(f"[{_fmt_epoch(t_unix)}] {target_path} <- {src_url}")
+                            rec_str = f"[{_fmt_epoch(t_unix)}] {target_path} <- {src_url}"
+                            if is_cheat_dl:
+                                dl_hits.append(rec_str)
+                            else:
+                                unverified_dl_hits.append(rec_str)
 
                 elif btype == "firefox":
                     cur.execute("SELECT COUNT(*) FROM moz_places")
@@ -454,6 +485,10 @@ def _check_browsers(ctx: ScanContext) -> None:
                             break
                         rows_checked += len(batch)
                         for url, title, lvd in batch:
+                            if url:
+                                active_url_keys.add(_norm_url_key(url))
+                                if title and title.strip():
+                                    active_url_keys.add(_norm_url_key(f"{url}{title.strip().split()[0]}"))
                             u_s = f"{url or ''} {title or ''}"
                             ulow = u_s.lower()
                             s, h_ctx, _ = match_cheat_signatures(u_s)
@@ -473,15 +508,24 @@ def _check_browsers(ctx: ScanContext) -> None:
                             "JOIN moz_places p ON a.place_id = p.id ORDER BY a.dateAdded DESC LIMIT 5000"
                         )
                         for purl, content, dadd in cur.fetchall():
+                            if purl:
+                                active_url_keys.add(_norm_url_key(purl))
                             combo = f"{purl or ''} {content or ''}"
                             clow = combo.lower()
                             s, h_ctx, _ = match_cheat_signatures(combo)
-                            if any(dom in clow for dom in CHEAT_DOMAINS) or s or h_ctx or (
-                                any(ext in clow for ext in (".jar", ".so", ".exe"))
+                            is_cheat_dl = bool(any(dom in clow for dom in CHEAT_DOMAINS) or s or h_ctx)
+                            is_unverified_dl = (
+                                not is_cheat_dl
+                                and any(ext in clow for ext in (".jar", ".so", ".exe"))
                                 and any(h in clow for h in SUSPICIOUS_UNVERIFIED_MOD_ORIGINS)
-                            ):
+                            )
+                            if is_cheat_dl or is_unverified_dl:
                                 t_unix = (dadd / 1_000_000) if dadd else 0
-                                dl_hits.append(f"[{_fmt_epoch(t_unix)}] {content} <- {purl}")
+                                rec_str = f"[{_fmt_epoch(t_unix)}] {content} <- {purl}"
+                                if is_cheat_dl:
+                                    dl_hits.append(rec_str)
+                                else:
+                                    unverified_dl_hits.append(rec_str)
                     except sqlite3.Error:
                         pass
             except sqlite3.Error as exc:
@@ -512,9 +556,23 @@ def _check_browsers(ctx: ScanContext) -> None:
                         severity=Severity.CRITICAL,
                         confidence=Confidence.CONFIRMED,
                         category="Browser Download",
-                        title=f"Tarayici indirmelerinde hile/supheli .jar/.exe kaydi ({label})",
-                        description="Dosya diskten silinmis olsa bile tarayici indirme kaydi duruyor.",
+                        title=f"Tarayici indirmelerinde hile .jar/.exe kaydi ({label})",
+                        description="Dosya diskten silinmis olsa bile bilinen hile/imzali indirme kaydi duruyor.",
                         evidence=dl_hits[:15],
+                        path=str(db_path),
+                    )
+                )
+            elif unverified_dl_hits:
+                ctx.add_finding(
+                    Finding(
+                        rule_id="E6-BROWSER-CHEAT-DOWNLOAD",
+                        engine=ENGINE_NAME,
+                        severity=Severity.MEDIUM,
+                        confidence=Confidence.MEDIUM,
+                        category="Unverified Mod/Binary Download",
+                        title=f"Dogrulanmamis kaynaktan (Discord/paylasim) .jar/.exe indirmesi ({label})",
+                        description="Dosya adinda hile imzasi yok ancak resmi Modrinth/CurseForge disi kaynaktan indirilmis; manuel kontrol onerilir.",
+                        evidence=unverified_dl_hits[:15],
                         path=str(db_path),
                     )
                 )
@@ -538,9 +596,19 @@ def _check_browsers(ctx: ScanContext) -> None:
 
             # Raw SQLite freelist & WAL carving (catches deleted records before VACUUM!)
             carved = _carve_raw_sqlite_urls(sidecar_paths)
-            # Report any carved URL not already surfaced in active SQL hits
-            existing_blob = "\n".join(url_hits + dl_hits)
-            deleted_only_carved = [u for u in carved if u not in existing_blob]
+            # Filter out any URL already present in active SQLite tables (using canonical base key to ignore trailing byte noise)
+            existing_blob = "\n".join(url_hits + dl_hits + unverified_dl_hits).lower()
+            active_url_keys.discard("")
+            deleted_only_carved: list[str] = []
+            for u in carved:
+                uk = _norm_url_key(u)
+                if not uk:
+                    continue
+                if uk in active_url_keys or uk in existing_blob:
+                    continue
+                if any(uk.startswith(ak) or ak.startswith(uk) for ak in active_url_keys if len(ak) >= 24):
+                    continue
+                deleted_only_carved.append(u)
             if deleted_only_carved:
                 ctx.add_finding(
                     Finding(
@@ -695,7 +763,7 @@ def _check_java_userprefs_and_autostart(ctx: ScanContext) -> None:
     uprefs = h / ".java/.userPrefs"
     if uprefs.is_dir():
         hits: list[str] = []
-        for xf in iter_files_safe(uprefs, max_depth=8, follow_symlinks=False):
+        for xf in iter_files_safe([uprefs], max_depth=8, follow_symlinks=False):
             if xf.suffix.lower() != ".xml":
                 continue
             txt = safe_read_text(xf, 128 * 1024)
@@ -721,7 +789,7 @@ def _check_java_userprefs_and_autostart(ctx: ScanContext) -> None:
     for adir in (h / ".config/autostart", h / ".config/systemd/user"):
         if not adir.is_dir():
             continue
-        for f in iter_files_safe(adir, max_depth=6, follow_symlinks=False):
+        for f in iter_files_safe([adir], max_depth=6, follow_symlinks=False):
             txt = safe_read_text(f, 65536)
             low = txt.lower()
             if any(k in low for k in ("xdotool", "ydotool", "dotool", "xclicker", "/tmp/", "/dev/shm/")) or any(

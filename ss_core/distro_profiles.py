@@ -64,11 +64,9 @@ TARGET_ALIASES: dict[str, str] = {
     "ubuntu24": "ubuntu_24_04",
     "ubuntu_24_04": "ubuntu_24_04",
     "noble": "ubuntu_24_04",
-    "mint22": "ubuntu_24_04",
     "ubuntu22": "ubuntu_22_04",
     "ubuntu_22_04": "ubuntu_22_04",
     "jammy": "ubuntu_22_04",
-    "mint21": "ubuntu_22_04",
     "debian": "debian",
     "bookworm": "debian",
     "trixie": "debian",
@@ -125,9 +123,9 @@ DISTRO_PROFILES: dict[str, DistroProfile] = {
     ),
     "ubuntu_24_04": DistroProfile(
         target_id="ubuntu_24_04",
-        display_name="Ubuntu 24.04 LTS & Mint 22",
+        display_name="Ubuntu 24.04 LTS",
         short_name="Ubuntu 24.04",
-        subtitle="Ubuntu 24.04 Noble, Linux Mint 22, Pop!_OS 24.04 (Kernel 6.8/6.11 + AppArmor + Snap)",
+        subtitle="Ubuntu 24.04 Noble, Pop!_OS 24.04 (Kernel 6.8/6.11 + AppArmor + Snap)",
         family="debian_ubuntu",
         is_immutable=False,
         pkg_manager="apt",
@@ -143,9 +141,9 @@ DISTRO_PROFILES: dict[str, DistroProfile] = {
     ),
     "ubuntu_22_04": DistroProfile(
         target_id="ubuntu_22_04",
-        display_name="Ubuntu 22.04 LTS & Mint 21",
+        display_name="Ubuntu 22.04 LTS",
         short_name="Ubuntu 22.04",
-        subtitle="Ubuntu 22.04 Jammy, Mint 21, Pop!_OS 22.04 (Kernel 5.15 GA / 6.8 HWE + Snap)",
+        subtitle="Ubuntu 22.04 Jammy, Pop!_OS 22.04 (Kernel 5.15 GA / 6.8 HWE + Snap)",
         family="debian_ubuntu",
         is_immutable=False,
         pkg_manager="apt",
@@ -163,7 +161,7 @@ DISTRO_PROFILES: dict[str, DistroProfile] = {
         target_id="debian",
         display_name="Debian 12 / 13",
         short_name="Debian",
-        subtitle="Bookworm (12) / Trixie (13), MX Linux, LMDE (Kernel 6.1 / 6.12 + AppArmor)",
+        subtitle="Bookworm (12) / Trixie (13), MX Linux (Kernel 6.1 / 6.12 + AppArmor)",
         family="debian_ubuntu",
         is_immutable=False,
         pkg_manager="apt",
@@ -315,20 +313,17 @@ def detect_host_distro(
         conf = "exact" if os_id in {"arch", "cachyos"} else "family"
         return DistroDetection("arch_cachyos", pretty, os_id, version_id, codename, False, False, krel, conf)
 
-    if os_id == "ubuntu" or "ubuntu" in id_like or os_id in {"linuxmint", "pop", "zorin", "elementary", "neon"}:
-        if os_id == "linuxmint" and "debian" in id_like and "ubuntu" not in id_like and not kv.get("UBUNTU_CODENAME"):
-            return DistroDetection("debian", pretty, os_id, version_id, codename, False, False, krel, "family")
+    if os_id == "ubuntu" or "ubuntu" in id_like or os_id in {"pop", "zorin", "elementary", "neon"}:
         is_22 = (
-            codename in {"jammy", "vera", "victoria", "virginia", "vanessa", "focal"}
+            codename in {"jammy", "focal"}
             or version_id.startswith("22.")
-            or version_id.startswith("21")
             or version_id.startswith("20.")
         )
         tid = "ubuntu_22_04" if is_22 else "ubuntu_24_04"
         conf = "exact" if os_id == "ubuntu" else "family"
         return DistroDetection(tid, pretty, os_id, version_id, codename, False, False, krel, conf)
 
-    if os_id in {"debian", "mx", "kali", "devuan", "parrot", "lmde"} or "debian" in id_like:
+    if os_id in {"debian", "mx", "kali", "devuan", "parrot"} or "debian" in id_like:
         conf = "exact" if os_id == "debian" else "family"
         return DistroDetection("debian", pretty, os_id, version_id, codename, False, False, krel, conf)
 

@@ -111,12 +111,13 @@ def main() -> int:
         if cp_elf.returncode != 0:
             print(f"[LAB-ERR] ELF headless scan failed rc={cp_elf.returncode}\nSTDOUT:\n{cp_elf.stdout}\nSTDERR:\n{cp_elf.stderr}", file=sys.stderr)
             return 1
-        txts = list(desk.glob("MC_SS_Raporu_*.txt"))
-        assert len(txts) == 1, f"Expected 1 Desktop txt, found {txts}"
-        txt = txts[0].read_text(encoding="utf-8")
-        assert "wurst-killaura-1.21.jar" in txt, "Built ELF missed cheat jar in Desktop report!"
-        assert prof.display_name in txt or distro_profiles.DISTRO_PROFILES[target_id].display_name in txt, "Missing Target OS profile in report!"
-        print(f"[lab-verify] Built ELF Desktop report OK ({txts[0].name}, {len(txt)} chars)")
+        htmls = list(desk.glob("MC_SS_Raporu_*.html"))
+        assert len(htmls) == 1, f"Expected 1 Desktop html, found {htmls}"
+        html_doc = htmls[0].read_text(encoding="utf-8")
+        assert "<!DOCTYPE html>" in html_doc, "Desktop report is not valid HTML!"
+        assert "wurst-killaura-1.21.jar" in html_doc, "Built ELF missed cheat jar in Desktop HTML report!"
+        assert prof.display_name in html_doc or distro_profiles.DISTRO_PROFILES[target_id].display_name in html_doc, "Missing Target OS profile in report!"
+        print(f"[lab-verify] Built ELF Desktop HTML report OK ({htmls[0].name}, {len(html_doc)} chars)")
 
         # 5. Also verify ELF --kernel-snapshot-helper JSON handling cleanly inside container
         cp_kh = subprocess.run(

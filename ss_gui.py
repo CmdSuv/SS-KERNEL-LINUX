@@ -63,17 +63,22 @@ def _run_headless_scan(argv: list[str]) -> int:
         target_os=args.target_os,
         deep_home_scan=True,
     )
+    def _safe_print(line: str) -> None:
+        try:
+            print(line, flush=True)
+        except BrokenPipeError:
+            pass
+
     _orch.run_all_engines(
         ctx,
-        progress_pct_cb=lambda pct, msg: print(f"[%{pct:3d}] {msg}", flush=True),
+        progress_pct_cb=lambda pct, msg: _safe_print(f"[%{pct:3d}] {msg}"),
     )
-    txt_path, payload = _e8.write_desktop_txt_report(
+    html_path, payload = _e8.write_desktop_html_report(
         ctx, desktop_dir=args.desktop_dir
     )
     ass = payload["assessment"]
-    print(
-        f"TAMAMLANDI | KARAR={ass['verdict']} | RISK={ass['risk_score']}/100 | RAPOR={txt_path}",
-        flush=True,
+    _safe_print(
+        f"TAMAMLANDI | KARAR={ass['verdict']} | RISK={ass['risk_score']}/100 | RAPOR={html_path}",
     )
     return 0
 
@@ -86,14 +91,15 @@ if __name__ == "__main__" and "--apply-iommu-helper" in sys.argv[1:]:
 if __name__ == "__main__" and "--headless-scan" in sys.argv[1:]:
     raise SystemExit(_run_headless_scan(sys.argv[1:]))
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QCloseEvent, QFont, QIcon, QPalette, QPixmap
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QFont, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
     QDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -113,6 +119,66 @@ from ss_core.models import ScanContext
 DEVELOPER_GITHUB_URL = "https://github.com/CmdSuv"
 UI_FONT_FAMILY = "Cantarell"
 UI_FONT_STACK = '"Cantarell", "Adwaita Sans", "Noto Sans", sans-serif'
+
+
+def _open_external(target: str) -> bool:
+    """Open a URL or local file in the user's default browser/app.
+
+    Frozen PyInstaller binaries inherit a private LD_LIBRARY_PATH that breaks xdg-open/gio and
+    QDesktopServices on Flatpak-first desktops (Bazzite), so use a sanitized environment first.
+    """
+    import shutil
+    import subprocess
+    import webbrowser
+
+    from ss_core.utils import sanitized_subproc_env
+
+    env = sanitized_subproc_env()
+    for cmd in (["xdg-open"], ["gio", "open"], ["kde-open"], ["kde-open5"], ["sensible-browser"]):
+        exe = shutil.which(cmd[0], path=env.get("PATH"))
+        if not exe:
+            continue
+        try:
+            proc = subprocess.Popen(
+                [exe, *cmd[1:], target],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            continue
+        try:
+            if proc.wait(timeout=1.2) == 0:
+                return True
+        except subprocess.TimeoutExpired:
+            return True
+    qurl = QUrl.fromLocalFile(target) if target.startswith("/") else QUrl(target)
+    if QDesktopServices.openUrl(qurl):
+        return True
+    try:
+        return bool(webbrowser.open(qurl.toString()))
+    except Exception:
+        return False
+
+
+_ENGINE_CHIPS: tuple[tuple[str, str], ...] = (
+    ("E1", "Bütünlük"),
+    ("E2", "Canlı Süreç"),
+    ("E3", "Girdi / Makro"),
+    ("E4", "Dosya / JAR"),
+    ("E5", "Minecraft"),
+    ("E6", "Tarayıcı İzleri"),
+    ("E7", "Ağ / USB"),
+    ("E8", "Korelasyon"),
+    ("E9", "Çekirdek / DMA"),
+)
+_CHIP_QSS = {
+    "idle": "color:#7b8aa3; background-color:#0a0f18; border:1px solid #1b2432; border-radius:8px;",
+    "active": "color:#93c5fd; background-color:#0e1d36; border:1px solid #2563eb; border-radius:8px;",
+    "done": "color:#4ade80; background-color:#08170f; border:1px solid #14532d; border-radius:8px;",
+}
 
 
 def _make_ui_font(point_size: float, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
@@ -170,7 +236,7 @@ CONSENT_CONTRACT_HTML = """
     Bu yazılım <b>%100 yerel (offline)</b> olarak çalışır. Tarama sırasında hiçbir dosyanızı,
     kişisel verinizi, tarayıcı geçmişinizi veya sistem bilginizi dış bir sunucuya göndermez,
     uzak bir yere yüklemez veya üçüncü taraflarla otomatik olarak paylaşmaz.
-    Tarama tamamlandığında yalnızca kendi bilgisayarınızın <b>Masaüstüne (.txt)</b>
+    Tarama tamamlandığında yalnızca kendi bilgisayarınızın <b>Masaüstüne (.html — tıklayınca tarayıcıda açılan yerel web raporu)</b>
     detaylı bir rapor dosyası oluşturulur; bu raporu incelemek veya bir yetkiliyle paylaşıp
     paylaşmamak tamamen sizin kendi kontrolünüzdedir.
   </p>
@@ -659,12 +725,12 @@ class ScanWorker(QThread):
             orchestrator.run_all_engines(ctx, progress_pct_cb=_on_pct)
             if ctx.is_cancelled():
                 raise orchestrator.ScanCancelledError("Tarama kullanici tarafindan iptal edildi.")
-            self.progress_changed.emit(99, "Detayli rapor Masaustune yaziliyor...")
-            txt_path, payload = engine8_reporter.write_desktop_txt_report(
+            self.progress_changed.emit(99, "Web raporu Masaustune yaziliyor...")
+            html_path, payload = engine8_reporter.write_desktop_html_report(
                 ctx, desktop_dir=self._desktop_dir
             )
             self.progress_changed.emit(100, "Tarama tamamlandi.")
-            self.scan_completed.emit(str(txt_path), payload)
+            self.scan_completed.emit(str(html_path), payload)
         except orchestrator.ScanCancelledError as exc:
             self.progress_changed.emit(0, "Tarama iptal edildi.")
             self.scan_cancelled.emit(str(exc))
@@ -709,98 +775,145 @@ class SentinelMainWindow(QMainWindow):
         self._distro_profile = profile
         self._worker: ScanWorker | None = None
         self._iommu_worker: IommuApplyWorker | None = None
+        self._last_report_path: Path | None = None
 
         self.setWindowTitle("MC SS Sentinel")
         ico = _load_app_icon()
         if not ico.isNull():
             self.setWindowIcon(ico)
-        self.setFixedSize(560, 468)
+        self.setFixedSize(640, 730)
         self.setStyleSheet(
             f"QMainWindow {{ background-color: #000000; color: #f8fafc; font-family: {UI_FONT_STACK}; }}"
         )
+        self._chip_labels: dict[int, QLabel] = {}
 
         central = QWidget(self)
         central.setStyleSheet(f"background-color: #000000; font-family: {UI_FONT_STACK};")
         self.setCentralWidget(central)
 
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(28, 24, 28, 18)
-        root_layout.setSpacing(14)
+        root_layout.setContentsMargins(26, 22, 26, 16)
+        root_layout.setSpacing(12)
 
-        # Centered symmetric hero header
-        hero_box = QVBoxLayout()
-        hero_box.setSpacing(6)
-        hero_row = QHBoxLayout()
-        hero_row.setSpacing(10)
-        hero_row.addStretch(1)
+        # --- Hero card -------------------------------------------------------------
+        hero = QFrame(central)
+        hero.setObjectName("HeroCard")
+        hero.setStyleSheet(
+            "#HeroCard { background-color: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #0b1426, stop:1 #060a12);"
+            " border: 1px solid #1e2a40; border-radius: 14px; }"
+        )
+        hero_lay = QVBoxLayout(hero)
+        hero_lay.setContentsMargins(20, 16, 20, 16)
+        hero_lay.setSpacing(10)
+
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
         logo_p = _asset_path("mc_ss_sentinel.png")
         if logo_p is not None:
             pix = QPixmap(str(logo_p)).scaled(
-                36,
-                36,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+                52, 52, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
             )
-            logo_lbl = QLabel(central)
+            logo_lbl = QLabel(hero)
             logo_lbl.setPixmap(pix)
-            logo_lbl.setFixedSize(36, 36)
+            logo_lbl.setFixedSize(52, 52)
             logo_lbl.setStyleSheet("background: transparent;")
-            hero_row.addWidget(logo_lbl)
-
-        title_lbl = QLabel("MC SS Sentinel", central)
-        title_lbl.setFont(_make_ui_font(16.5, QFont.Weight.DemiBold))
-        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            top_row.addWidget(logo_lbl)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        title_lbl = QLabel("MC SS Sentinel", hero)
+        title_lbl.setFont(_make_ui_font(19.0, QFont.Weight.Bold))
         title_lbl.setStyleSheet("color: #f8fafc; background: transparent;")
-        hero_row.addWidget(title_lbl)
-        hero_row.addStretch(1)
-        hero_box.addLayout(hero_row)
-
-        sub_lbl = QLabel("Linux Derin Adli Hile Kontrol Aracı", central)
-        sub_lbl.setFont(_make_ui_font(9.4))
-        sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_col.addWidget(title_lbl)
+        sub_lbl = QLabel("Linux Derin Adli Hile Kontrol Aracı", hero)
+        sub_lbl.setFont(_make_ui_font(10.0))
         sub_lbl.setStyleSheet("color: #8b9bb4; background: transparent;")
-        hero_box.addWidget(sub_lbl)
+        title_col.addWidget(sub_lbl)
+        top_row.addLayout(title_col, 1)
+        hero_lay.addLayout(top_row)
 
-        os_bar = QHBoxLayout()
-        os_bar.setSpacing(8)
-        os_bar.addStretch(1)
-        self.os_badge_label = QLabel(f"Hedef OS: {self._distro_profile.display_name}", central)
-        self.os_badge_label.setFixedHeight(28)
-        self.os_badge_label.setFont(_make_ui_font(8.8, QFont.Weight.DemiBold))
-        self.os_badge_label.setStyleSheet(
-            "color: #93c5fd; background-color: #0b1220; border: 1px solid #1e3a5f; border-radius: 7px; padding: 0px 12px;"
+        tag_row = QHBoxLayout()
+        tag_row.setSpacing(8)
+        for txt in ("9 Analiz Motoru", "Ring-0 Çekirdek", "Tamamen Çevrimdışı", "Salt-Okunur"):
+            tag = QLabel(txt, hero)
+            tag.setFont(_make_ui_font(8.6, QFont.Weight.DemiBold))
+            tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            tag.setFixedHeight(24)
+            tag.setStyleSheet(
+                "color:#93c5fd; background-color:#0b1a30; border:1px solid #1e3a5f;"
+                " border-radius:12px; padding:0px 12px;"
+            )
+            tag_row.addWidget(tag)
+        tag_row.addStretch(1)
+        hero_lay.addLayout(tag_row)
+        root_layout.addWidget(hero)
+
+        # --- Target OS card ----------------------------------------------------------
+        os_card = QFrame(central)
+        os_card.setObjectName("OsCard")
+        os_card.setFixedHeight(54)
+        os_card.setStyleSheet(
+            "#OsCard { background-color: #080b11; border: 1px solid #1b2432; border-radius: 10px; }"
         )
-        os_bar.addWidget(self.os_badge_label)
-
-        self.change_os_button = QPushButton("OS Değiştir", central)
-        self.change_os_button.setFixedHeight(28)
-        self.change_os_button.setFont(_make_ui_font(8.8, QFont.Weight.Medium))
+        os_row = QHBoxLayout(os_card)
+        os_row.setContentsMargins(16, 8, 12, 8)
+        os_row.setSpacing(10)
+        os_cap = QLabel("HEDEF SİSTEM", os_card)
+        os_cap.setFont(_make_ui_font(8.0, QFont.Weight.Bold))
+        os_cap.setStyleSheet("color:#64748b; background: transparent; letter-spacing: 1px;")
+        os_row.addWidget(os_cap)
+        self.os_badge_label = QLabel(f"Hedef OS: {self._distro_profile.display_name}", os_card)
+        self.os_badge_label.setFont(_make_ui_font(10.0, QFont.Weight.DemiBold))
+        self.os_badge_label.setStyleSheet("color: #e2e8f0; background: transparent;")
+        os_row.addWidget(self.os_badge_label, 1)
+        self.change_os_button = QPushButton("OS Değiştir", os_card)
+        self.change_os_button.setFixedHeight(32)
+        self.change_os_button.setFont(_make_ui_font(9.0, QFont.Weight.Medium))
         self.change_os_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.change_os_button.setStyleSheet(
-            "QPushButton { background-color: #0c111b; color: #cbd5e1; border: 1px solid #283344; border-radius: 7px; padding: 0px 12px; }"
+            "QPushButton { background-color: #0c111b; color: #cbd5e1; border: 1px solid #283344; border-radius: 8px; padding: 0px 14px; }"
             "QPushButton:hover { border-color: #3b82f6; color: #ffffff; background-color: #131c2c; }"
+            "QPushButton:disabled { color: #475569; border-color: #1a2230; }"
         )
         self.change_os_button.clicked.connect(self.select_target_os)
-        os_bar.addWidget(self.change_os_button)
-        os_bar.addStretch(1)
-        hero_box.addLayout(os_bar)
-        root_layout.addLayout(hero_box)
+        os_row.addWidget(self.change_os_button)
+        root_layout.addWidget(os_card)
 
-        sep = QFrame(central)
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFixedHeight(1)
-        sep.setStyleSheet("background-color: #161d28; border: none;")
-        root_layout.addWidget(sep)
+        # --- Engine status grid ------------------------------------------------------
+        eng_card = QFrame(central)
+        eng_card.setObjectName("EngCard")
+        eng_card.setStyleSheet(
+            "#EngCard { background-color: #080b11; border: 1px solid #1b2432; border-radius: 10px; }"
+        )
+        eng_lay = QVBoxLayout(eng_card)
+        eng_lay.setContentsMargins(14, 12, 14, 12)
+        eng_lay.setSpacing(8)
+        eng_cap = QLabel("ANALİZ MOTORLARI", eng_card)
+        eng_cap.setFont(_make_ui_font(8.0, QFont.Weight.Bold))
+        eng_cap.setStyleSheet("color:#64748b; background: transparent; letter-spacing: 1px;")
+        eng_lay.addWidget(eng_cap)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        for i, (code, name) in enumerate(_ENGINE_CHIPS):
+            chip = QLabel(f"{code}  {name}", eng_card)
+            chip.setFont(_make_ui_font(8.8, QFont.Weight.Medium))
+            chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            chip.setFixedHeight(30)
+            chip.setStyleSheet(_CHIP_QSS["idle"])
+            self._chip_labels[i + 1] = chip
+            grid.addWidget(chip, i // 3, i % 3)
+        eng_lay.addLayout(grid)
+        root_layout.addWidget(eng_card)
 
-        # Symmetric options card (checkbox with real checkmark + matching IOMMU action button)
+        # --- Options card ------------------------------------------------------------
         opts_card = QFrame(central)
         opts_card.setObjectName("OptsCard")
-        opts_card.setFixedHeight(50)
+        opts_card.setFixedHeight(54)
         opts_card.setStyleSheet(
             "#OptsCard { background-color: #080b11; border: 1px solid #1b2432; border-radius: 10px; }"
         )
         opts_row = QHBoxLayout(opts_card)
-        opts_row.setContentsMargins(14, 8, 14, 8)
+        opts_row.setContentsMargins(16, 8, 12, 8)
         opts_row.setSpacing(10)
 
         check_png = _asset_path("check_white.png")
@@ -815,7 +928,7 @@ class SentinelMainWindow(QMainWindow):
         self.kernel_lkm_checkbox.setToolTip(
             "Polkit yetkisiyle geçici mc_ss_kmod.ko yükler; tarama bitince otomatik kaldırır (Gir-Tara-Çık)."
         )
-        self.kernel_lkm_checkbox.setFont(_make_ui_font(9.5, QFont.Weight.Medium))
+        self.kernel_lkm_checkbox.setFont(_make_ui_font(9.8, QFont.Weight.Medium))
         self.kernel_lkm_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self.kernel_lkm_checkbox.setChecked(enable_kernel_lkm_default)
         self.kernel_lkm_checkbox.setStyleSheet(
@@ -823,11 +936,11 @@ class SentinelMainWindow(QMainWindow):
             QCheckBox {{
                 color: #dbe2ea;
                 background: transparent;
-                spacing: 8px;
+                spacing: 9px;
             }}
             QCheckBox::indicator {{
-                width: 17px;
-                height: 17px;
+                width: 18px;
+                height: 18px;
                 border: 1px solid #384457;
                 background-color: #0d1117;
                 border-radius: 5px;
@@ -845,7 +958,7 @@ class SentinelMainWindow(QMainWindow):
         opts_row.addWidget(self.kernel_lkm_checkbox, stretch=1)
 
         self.iommu_button = QPushButton("IOMMU / DMA Koruma", opts_card)
-        self.iommu_button.setMinimumHeight(30)
+        self.iommu_button.setFixedHeight(32)
         self.iommu_button.setFont(_make_ui_font(9.0, QFont.Weight.DemiBold))
         self.iommu_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.iommu_button.setStyleSheet(
@@ -854,8 +967,8 @@ class SentinelMainWindow(QMainWindow):
                 background-color: #10151f;
                 color: #fbbf24;
                 border: 1px solid #2a3342;
-                border-radius: 7px;
-                padding: 4px 12px;
+                border-radius: 8px;
+                padding: 0px 14px;
             }
             QPushButton:hover {
                 background-color: #182030;
@@ -871,20 +984,20 @@ class SentinelMainWindow(QMainWindow):
         opts_row.addWidget(self.iommu_button)
         root_layout.addWidget(opts_card)
 
-        # Refined primary 'Tara' CTA button + cooperative Cancel button while running
+        # --- Primary action ----------------------------------------------------------
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
-        self.scan_button = QPushButton("Tara", central)
-        self.scan_button.setMinimumHeight(46)
-        self.scan_button.setFont(_make_ui_font(11.5, QFont.Weight.DemiBold))
+        self.scan_button = QPushButton("Taramayı Başlat", central)
+        self.scan_button.setMinimumHeight(50)
+        self.scan_button.setFont(_make_ui_font(12.0, QFont.Weight.Bold))
         self.scan_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.scan_button.setStyleSheet(_PRIMARY_BTN_QSS)
         self.scan_button.clicked.connect(self.start_scan)
         action_row.addWidget(self.scan_button, 1)
 
         self.cancel_button = QPushButton("İptal", central)
-        self.cancel_button.setMinimumHeight(46)
-        self.cancel_button.setFixedWidth(96)
+        self.cancel_button.setMinimumHeight(50)
+        self.cancel_button.setFixedWidth(100)
         self.cancel_button.setFont(_make_ui_font(10.0, QFont.Weight.DemiBold))
         self.cancel_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cancel_button.setStyleSheet(
@@ -911,7 +1024,7 @@ class SentinelMainWindow(QMainWindow):
         action_row.addWidget(self.cancel_button)
         root_layout.addLayout(action_row)
 
-        # Balanced centered status card
+        # --- Status card -------------------------------------------------------------
         self.status_frame = QFrame(central)
         self.status_frame.setObjectName("StatusCard")
         self.status_frame.setFrameShape(QFrame.Shape.StyledPanel)
@@ -936,9 +1049,38 @@ class SentinelMainWindow(QMainWindow):
             "color: #cbd5e1; border: none; background: transparent;"
         )
         frame_layout.addWidget(self.status_label)
+
+        self.open_report_button = QPushButton("Raporu Tarayıcıda Aç", self.status_frame)
+        self.open_report_button.setMinimumHeight(34)
+        self.open_report_button.setFont(_make_ui_font(9.4, QFont.Weight.DemiBold))
+        self.open_report_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.open_report_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #0e1d36;
+                color: #93c5fd;
+                border: 1px solid #2563eb;
+                border-radius: 8px;
+                padding: 5px 18px;
+                margin-top: 6px;
+            }
+            QPushButton:hover {
+                background-color: #16305a;
+                color: #ffffff;
+                border-color: #60a5fa;
+            }
+            QPushButton:pressed {
+                background-color: #0a1629;
+            }
+            """
+        )
+        self.open_report_button.clicked.connect(self.open_last_report)
+        self.open_report_button.setVisible(False)
+        frame_layout.addWidget(self.open_report_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
         root_layout.addWidget(self.status_frame, stretch=1)
 
-        # Sleek percentage progress bar
+        # --- Progress ----------------------------------------------------------------
         self.progress_bar = QProgressBar(central)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -957,14 +1099,14 @@ class SentinelMainWindow(QMainWindow):
                 text-align: center;
             }
             QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16a34a, stop:1 #22c55e);
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563eb, stop:1 #22c55e);
                 border-radius: 7px;
             }
             """
         )
         root_layout.addWidget(self.progress_bar)
 
-        # Symmetric footer: left engine badge mirrors right developer credit
+        # --- Footer ------------------------------------------------------------------
         footer_row = QHBoxLayout()
         footer_row.setContentsMargins(2, 2, 2, 0)
         self.ver_label = QLabel("v2.0 • 9 Motor + Ring-0", central)
@@ -974,18 +1116,42 @@ class SentinelMainWindow(QMainWindow):
         footer_row.addStretch(1)
         self.dev_label = QLabel(
             f'<span style="color:#64748b;">Geliştirici:</span> '
-            f'<a href="{DEVELOPER_GITHUB_URL}" style="color:#60a5fa; text-decoration:none; font-weight:600;">CmdSuv</a> '
-            f'<span style="color:#475569;">•</span> '
-            f'<a href="{DEVELOPER_GITHUB_URL}" style="color:#60a5fa; text-decoration:none;">github.com/CmdSuv</a>',
+            f'<a href="{DEVELOPER_GITHUB_URL}" style="color:#60a5fa; text-decoration:none; font-weight:600;">CmdSuv</a>',
             central,
         )
         self.dev_label.setFont(_make_ui_font(8.8))
         self.dev_label.setTextFormat(Qt.TextFormat.RichText)
-        self.dev_label.setOpenExternalLinks(True)
+        self.dev_label.setOpenExternalLinks(False)
+        self.dev_label.linkActivated.connect(self.open_developer_page)
         self.dev_label.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dev_label.setStyleSheet("background: transparent;")
         footer_row.addWidget(self.dev_label)
+        self.github_button = QPushButton("github.com/CmdSuv", central)
+        self.github_button.setFixedHeight(26)
+        self.github_button.setFont(_make_ui_font(8.8, QFont.Weight.DemiBold))
+        self.github_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.github_button.setToolTip(DEVELOPER_GITHUB_URL)
+        self.github_button.setStyleSheet(
+            "QPushButton { color:#93c5fd; background-color:#0b1a30; border:1px solid #1e3a5f;"
+            " border-radius:13px; padding:0px 12px; }"
+            "QPushButton:hover { color:#ffffff; background-color:#16305a; border-color:#60a5fa; }"
+        )
+        self.github_button.clicked.connect(self.open_developer_page)
+        footer_row.addWidget(self.github_button)
         root_layout.addLayout(footer_row)
+
+    def open_developer_page(self, *_args: object) -> None:
+        if not _open_external(DEVELOPER_GITHUB_URL):
+            self.status_label.setText(f"Tarayıcı açılamadı. Adres: {DEVELOPER_GITHUB_URL}")
+
+    def _set_engine_chip(self, engine_no: int, state: str) -> None:
+        chip = self._chip_labels.get(engine_no)
+        if chip is not None:
+            chip.setStyleSheet(_CHIP_QSS[state])
+
+    def _reset_engine_chips(self, state: str = "idle") -> None:
+        for n in self._chip_labels:
+            self._set_engine_chip(n, state)
 
     def select_target_os(self) -> None:
         dlg = TargetOSDialog(default_target_os=self._target_os, parent=self)
@@ -999,9 +1165,12 @@ class SentinelMainWindow(QMainWindow):
     def start_scan(self) -> None:
         if self._worker is not None and self._worker.isRunning():
             return
+        self._last_report_path = None
+        self.open_report_button.setVisible(False)
         self.scan_button.setEnabled(False)
         self.kernel_lkm_checkbox.setEnabled(False)
         self.change_os_button.setEnabled(False)
+        self._reset_engine_chips("idle")
         self.scan_button.setText("Taranıyor...")
         self.cancel_button.setEnabled(True)
         self.cancel_button.setVisible(True)
@@ -1094,26 +1263,44 @@ class SentinelMainWindow(QMainWindow):
     def _on_progress(self, pct: int, msg: str) -> None:
         self.progress_bar.setValue(pct)
         self.status_label.setText(f"[%{pct}] {msg}")
+        import re
+
+        m = re.search(r"\bE([1-9])\b", msg)
+        if m:
+            self._set_engine_chip(int(m.group(1)), "done" if "tamamland" in msg.lower() else "active")
 
     def _reset_scan_controls(self) -> None:
         self.scan_button.setEnabled(True)
         self.kernel_lkm_checkbox.setEnabled(True)
         self.change_os_button.setEnabled(True)
-        self.scan_button.setText("Tara")
+        self.scan_button.setText("Taramayı Başlat")
         self.cancel_button.setVisible(False)
         self.cancel_button.setEnabled(False)
 
-    def _on_completed(self, _txt_path: str, _payload: dict[str, Any]) -> None:
+    def open_last_report(self) -> None:
+        rp = self._last_report_path
+        if rp is None or not rp.is_file():
+            return
+        if not _open_external(str(rp)):
+            self.status_label.setText(f"Rapor açılamadı. Dosya: {rp}")
+
+    def _on_completed(self, report_path: str, _payload: dict[str, Any]) -> None:
+        self._last_report_path = Path(report_path) if report_path else None
         self.progress_bar.setValue(100)
+        self._reset_engine_chips("done")
         self._reset_scan_controls()
         self.status_label.setStyleSheet(
             "color: #4ade80; border: none; background: transparent;"
         )
         self.status_label.setFont(_make_ui_font(10.0, QFont.Weight.DemiBold))
-        self.status_label.setText("Tarama tamamlandı. Rapor masaüstüne kaydedildi.")
+        self.status_label.setText(
+            "Tarama tamamlandı. Web raporu masaüstüne kaydedildi."
+        )
+        self.open_report_button.setVisible(self._last_report_path is not None)
 
     def _on_cancelled(self, _reason: str) -> None:
         self.progress_bar.setValue(0)
+        self._reset_engine_chips("idle")
         self._reset_scan_controls()
         self.status_label.setFont(_make_ui_font(10.0))
         self.status_label.setStyleSheet(

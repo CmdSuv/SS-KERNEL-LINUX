@@ -1074,6 +1074,16 @@ def execute_kernel_snapshot_helper(
                             result["root_extras"]["proc_pids_at_lkm"] = sorted(
                                 pids_before | pids_after
                             )
+                            helper_self_pids = {os.getpid(), os.getppid()}
+                            helper_meipass = str(getattr(sys, "_MEIPASS", "") or "")
+                            result["root_extras"]["sentinel_self_pids"] = sorted(helper_self_pids)
+                            result["root_extras"]["sentinel_self_meipasses"] = (
+                                [helper_meipass] if helper_meipass else []
+                            )
+                            try:
+                                result["root_extras"]["sentinel_self_exe"] = str(Path(sys.executable).resolve())
+                            except OSError:
+                                result["root_extras"]["sentinel_self_exe"] = str(sys.executable)
                 finally:
                     unloaded = _rmmod_cleanly("mc_ss_kmod")
                     result["lkm_unloaded_cleanly"] = unloaded
@@ -1160,6 +1170,21 @@ def collect_privileged_kernel_snapshot(
             try:
                 data = json.loads(cp.stdout)
                 if isinstance(data, dict):
+                    rext = data.setdefault("root_extras", {})
+                    if isinstance(rext, dict):
+                        cur_pids = set(rext.get("sentinel_self_pids") or [])
+                        cur_pids.update({os.getpid(), os.getppid()})
+                        rext["sentinel_self_pids"] = sorted(cur_pids)
+                        cur_meis = list(rext.get("sentinel_self_meipasses") or [])
+                        parent_mei = str(getattr(sys, "_MEIPASS", "") or "")
+                        if parent_mei and parent_mei not in cur_meis:
+                            cur_meis.append(parent_mei)
+                        rext["sentinel_self_meipasses"] = cur_meis
+                        if not rext.get("sentinel_self_exe"):
+                            try:
+                                rext["sentinel_self_exe"] = str(Path(sys.executable).resolve())
+                            except OSError:
+                                rext["sentinel_self_exe"] = str(sys.executable)
                     return data
             except json.JSONDecodeError:
                 pass

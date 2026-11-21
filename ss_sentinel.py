@@ -159,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
 
     orchestrator.run_all_engines(ctx, selected_engines=selected, progress_cb=_log)
     payload = engine8_reporter.build_report_payload(ctx)
-    paths = engine8_reporter.write_reports(ctx, args.out_dir)
+    paths = engine8_reporter.write_reports(ctx, args.out_dir, payload=payload)
 
     if args.json_stdout:
         print(json.dumps(payload, indent=2, ensure_ascii=False))

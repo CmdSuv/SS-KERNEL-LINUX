@@ -467,6 +467,12 @@ def match_restricted_utility_mods(raw_text: str) -> list[str]:
     return sorted({m.group(1).lower() for m in _RESTRICTED_MOD_RE.finditer(raw_text)})
 
 
+_BENIGN_COMPOUND_SUBSTRINGS_RE = re.compile(
+    r"wildclienttextureasset|selfdestructonping",
+    re.IGNORECASE,
+)
+
+
 def match_cheat_signatures(raw_text: str) -> tuple[list[str], list[str], list[str]]:
     """Match text against strict and contextual cheat signatures.
 
@@ -478,6 +484,9 @@ def match_cheat_signatures(raw_text: str) -> tuple[list[str], list[str], list[st
     low = raw_text.lower()
     if _ANY_CHEAT_LITERAL_RE.search(low) is None:
         return [], [], []
+    if "wildclienttextureasset" in low or "selfdestructonping" in low:
+        raw_text = _BENIGN_COMPOUND_SUBSTRINGS_RE.sub(" ", raw_text)
+        low = raw_text.lower()
     strict_hits = sorted({m.group(0) for m in _STRICT_CS_PATTERN.finditer(low)})
     ctx_hits = {m.group(1).lower() for m in _CONTEXT_COMBINED_RE.finditer(raw_text)}
     high_ctx = sorted(t for t in ctx_hits if t in HIGH_SIGNAL_MODULE_NAMES)

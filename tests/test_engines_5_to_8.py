@@ -110,6 +110,7 @@ class TestEngine6DesktopTraces(unittest.TestCase):
             # 4. Chrome SQLite: DELETE rows WITHOUT VACUUM so freelist carving catches deleted URL!
             chrome_db = home / ".config/google-chrome/Default/History"
             conn = sqlite3.connect(chrome_db)
+            conn.execute("PRAGMA secure_delete = OFF")
             now_wk = int((time.time() + 11644473600) * 1_000_000)
             conn.execute(
                 "INSERT INTO urls VALUES (999, 'https://doomsdayclient.com/download/dd.jar', 'Doomsday', 1, ?)",

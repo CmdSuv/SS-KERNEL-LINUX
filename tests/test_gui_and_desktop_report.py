@@ -107,6 +107,129 @@ class TestGuiProgressAndDesktopTxtReport(unittest.TestCase):
             self.assertIn(str(txt_path), txt)
             self.assertIn(payload["report_sha256"], txt)
 
+    def test_detailed_desktop_html_web_report_and_consistency(self) -> None:
+        import json
+        import re
+        from ss_core.models import Confidence, Finding, Severity
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            home, root, proc = build_clean_baseline(base)
+            desktop = home / "Desktop"
+            desktop.mkdir(parents=True, exist_ok=True)
+
+            # Drop a cheat JAR + XSS-shaped filename to verify HTML/JS safety & consistency
+            make_jar(
+                home / ".minecraft/mods/wurst-client.jar",
+                {
+                    "fabric.mod.json": b'{"id":"wurst","name":"Wurst"}',
+                    "net/wurstclient/KillAura.class": b"\xca\xfe\xba\xbe\x00\x00\x00\x41\x00\x01",
+                },
+            )
+            ctx = ScanContext(
+                home_dir=home,
+                root_prefix=root,
+                proc_root=proc,
+                live_mode=False,
+            )
+            orchestrator.run_all_engines(ctx)
+            # Inject an XSS-like finding path to prove HTML & script-JSON escaping hold
+            ctx.add_finding(
+                Finding(
+                    rule_id="E4-FILE-CHEAT-NAME",
+                    engine="Engine 4",
+                    severity=Severity.HIGH,
+                    confidence=Confidence.CONFIRMED,
+                    category="Test XSS",
+                    title="Test </script><img src=x onerror=alert(1)>",
+                    description="XSS guard check",
+                    path="/tmp/</script><script>alert(1)</script>.jar",
+                    evidence=["</script><svg onload=alert(1)>"],
+                )
+            )
+            html_path, payload = engine8_reporter.write_desktop_html_report(ctx, desktop_dir=desktop)
+            self.assertTrue(html_path.exists())
+            self.assertEqual(desktop, html_path.parent)
+            self.assertTrue(html_path.name.startswith("MC_SS_Raporu_"))
+            self.assertTrue(html_path.name.endswith(".html"))
+
+            doc = html_path.read_text(encoding="utf-8")
+            self.assertIn("<!DOCTYPE html>", doc)
+            self.assertIn("Content-Security-Policy", doc)
+            self.assertIn("default-src 'none'", doc)
+            self.assertNotIn("<script src=", doc)
+            self.assertNotIn("<link rel=\"stylesheet\" href=\"http", doc)
+            # Raw unescaped XSS tags must NEVER appear anywhere in HTML
+            self.assertNotIn("<img src=x onerror=alert(1)>", doc)
+            self.assertNotIn("<script>alert(1)</script>", doc)
+            self.assertNotIn("<svg onload=alert(1)>", doc)
+            self.assertIn("wurst-client.jar", doc)
+            self.assertIn(payload["report_sha256"], doc)
+            self.assertIn(payload["assessment"]["verdict"], doc)
+            self.assertIn("TXT İndir", doc)
+            self.assertIn("JSON İndir", doc)
+            self.assertIn("Yazdır / PDF", doc)
+
+            # Embedded JSON & TXT download blobs must parse cleanly and match payload 1:1
+            m_json = re.search(r'<script id="ss-json-blob" type="application/json">(.*?)</script>', doc, re.S)
+            m_txt = re.search(r'<script id="ss-txt-blob" type="application/json">(.*?)</script>', doc, re.S)
+            self.assertIsNotNone(m_json)
+            self.assertIsNotNone(m_txt)
+            assert m_json is not None and m_txt is not None
+            embedded_json_wrap = json.loads(m_json.group(1))
+            embedded_payload = json.loads(embedded_json_wrap["content"])
+            embedded_txt_wrap = json.loads(m_txt.group(1))
+            self.assertEqual(payload["report_sha256"], embedded_payload["report_sha256"])
+            self.assertEqual(payload["assessment"]["risk_score"], embedded_payload["assessment"]["risk_score"])
+            self.assertEqual(payload["assessment"]["verdict"], embedded_payload["assessment"]["verdict"])
+            self.assertEqual(payload["assessment"]["domain_scores"], embedded_payload["assessment"]["domain_scores"])
+            self.assertIn(payload["report_sha256"], embedded_txt_wrap["content"])
+
+    def test_domain_classification_consistency_audit(self) -> None:
+        from ss_core.models import Confidence, Finding, Severity
+
+        def _f(rid: str, ev: list[str] | None = None) -> Finding:
+            return Finding(
+                rule_id=rid,
+                engine=rid.split("-")[0],
+                severity=Severity.HIGH,
+                confidence=Confidence.HIGH,
+                category="Audit",
+                title="Audit",
+                description="Audit",
+                evidence=ev or [],
+            )
+
+        # Passive /dev/uinput permission must NOT land in cheat_evidence
+        self.assertEqual("os_security", engine8_reporter._classify_domain(_f("E3-UINPUT-WRITABLE")))
+        # System package update deleted binary in /usr stays os_security; home/tmp deleted binary is cheat_evidence
+        self.assertEqual("os_security", engine8_reporter._classify_domain(_f("E2-PROC-DELETED-EXE", ["exe=/usr/bin/firefox (deleted)"])))
+        self.assertEqual("cheat_evidence", engine8_reporter._classify_domain(_f("E2-PROC-DELETED-EXE", ["exe=/tmp/ghost (deleted)"])))
+        # Real cheat & injection rules must land in cheat_evidence
+        for rid in (
+            "E1-HIST-CHEAT-CMD",
+            "E1-ETC-LD-PRELOAD",
+            "E2-PROC-MEMFD-EXE",
+            "E2-PROC-TRACERPID",
+            "E2-FD-CHEAT-PATH",
+            "E4-FILE-CHEAT-NAME",
+            "E4-RP-XRAY-TEXTURE",
+            "E4-SHADER-XRAY",
+            "E6-CLIPBOARD-HIT",
+            "E6-JAVA-USERPREFS-CHEAT",
+            "E9-AUDIT-INJECT-SYSCALL",
+        ):
+            self.assertEqual("cheat_evidence", engine8_reporter._classify_domain(_f(rid)), f"Misclassified {rid}")
+        # Anti-forensic wiping & future timestomp must land in forensic_tampering
+        for rid in (
+            "E1-HIST-TRUNCATED",
+            "E1-XBEL-DEVNULL",
+            "E1-XBEL-WIPED",
+            "E1-PKG-LOG-TAMPERED",
+            "E4-TIME-FUTURE",
+        ):
+            self.assertEqual("forensic_tampering", engine8_reporter._classify_domain(_f(rid)), f"Misclassified {rid}")
+
     def test_resolve_desktop_and_self_bin_exemption(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
@@ -169,11 +292,20 @@ class TestGuiProgressAndDesktopTxtReport(unittest.TestCase):
             win = ss_gui.SentinelMainWindow(home_dir=home, desktop_dir=desktop)
             self.assertFalse(win.windowIcon().isNull(), "App icon must load for SentinelMainWindow")
             self.assertIn("#000000", win.styleSheet())
-            self.assertEqual("Tara", win.scan_button.text())
+            self.assertEqual("Taramayı Başlat", win.scan_button.text())
             self.assertEqual(0, win.progress_bar.value())
-            self.assertTrue(win.dev_label.openExternalLinks())
             self.assertIn("CmdSuv", win.dev_label.text())
             self.assertIn("https://github.com/CmdSuv", win.dev_label.text())
+            self.assertEqual(9, len(win._chip_labels))
+            opened: list[str] = []
+            orig_open = ss_gui._open_external
+            ss_gui._open_external = lambda target: opened.append(target) or True  # type: ignore[assignment]
+            try:
+                win.github_button.click()
+                win.dev_label.linkActivated.emit("https://github.com/CmdSuv")
+            finally:
+                ss_gui._open_external = orig_open  # type: ignore[assignment]
+            self.assertEqual(["https://github.com/CmdSuv"] * 2, opened)
 
             loop = QEventLoop()
             finished_ok: list[bool] = []
@@ -202,8 +334,12 @@ class TestGuiProgressAndDesktopTxtReport(unittest.TestCase):
             self.assertIn("masaüstüne kaydedildi", status_txt.lower())
             self.assertNotIn("Risk:", status_txt)
             self.assertNotIn("KRITIK", status_txt)
-            txts = list(desktop.glob("MC_SS_Raporu_*.txt"))
-            self.assertEqual(1, len(txts))
+            self.assertFalse(win.open_report_button.isHidden())
+            self.assertIsNotNone(win._last_report_path)
+            self.assertTrue(win._last_report_path.name.endswith(".html"))
+            htmls = list(desktop.glob("MC_SS_Raporu_*.html"))
+            self.assertEqual(1, len(htmls))
+            self.assertIn("<!DOCTYPE html>", htmls[0].read_text(encoding="utf-8"))
 
     def test_self_manifest_skips_exact_sha_only_not_tampered_script(self) -> None:
         from ss_core import _self_manifest, engine4_deep_files

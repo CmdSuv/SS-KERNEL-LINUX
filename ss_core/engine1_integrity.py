@@ -362,12 +362,31 @@ def _check_shell_histories(ctx: ScanContext) -> None:
                 cheat_hits.append(f"Satir {idx} (tmp/shm exec): {sline[:180]}")
 
         if af_hits:
+            has_hist_timestamps = any(
+                ln.startswith("#1") or ln.startswith(": 1")
+                for ln in content.splitlines()[:200]
+            )
+            only_journal_maint = all(
+                "journalctl" in h.lower()
+                and not any(
+                    k in h.lower()
+                    for k in ("history", "shred", "wipe", "srm", "touch", "rm ", "minecraft", "vape", "cheat", "sqlite")
+                )
+                for h in af_hits
+            )
+            # Untimestamped routine `journalctl --rotate/--vacuum` maintenance is MEDIUM (cannot prove recency)
+            if only_journal_maint and not has_hist_timestamps:
+                af_sev = Severity.MEDIUM
+                af_conf = Confidence.MEDIUM
+            else:
+                af_sev = Severity.CRITICAL
+                af_conf = Confidence.CONFIRMED
             ctx.add_finding(
                 Finding(
                     rule_id="E1-HIST-ANTIFORENSIC-CMD",
                     engine=ENGINE_NAME,
-                    severity=Severity.CRITICAL,
-                    confidence=Confidence.CONFIRMED,
+                    severity=af_sev,
+                    confidence=af_conf,
                     category="Anti-Forensics / Commands",
                     title=f"Gecmis dosyasinda iz silme / adli manipulasyon komutu ({hf.name})",
                     description="Terminal gecmisinde dosya yok etme, gecmis silme veya tarih degistirme komutu tespit edildi.",

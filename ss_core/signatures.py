@@ -424,6 +424,10 @@ RESTRICTED_UTILITY_MOD_IDENTIFIERS: tuple[str, ...] = (
     "potionrefill",
     "potion-refill",
     "autorefill",
+    "fullbright",
+    "fullbrightub",
+    "gammautils",
+    "gamma-utils",
 )
 
 # ---------------------------------------------------------------------------
@@ -600,8 +604,6 @@ CONTEXTUAL_CHEAT_MODULES: tuple[str, ...] = (
     "palettenewchunks",
     "oresim",
     "antivanish",
-    "fullbright",
-    "gammautils",
     "freecam",
     "xray",
     "x-ray",
@@ -730,7 +732,6 @@ HIGH_SIGNAL_MODULE_NAMES: frozenset[str] = frozenset(
         "autospear",
         "auto_spear",
         "spearmacro",
-        "elytramace",
         "cheststealer",
         "chest_stealer",
         "scaffoldwalk",
@@ -749,7 +750,6 @@ HIGH_SIGNAL_MODULE_NAMES: frozenset[str] = frozenset(
         "phasehack",
         "blinkhack",
         "flyhack",
-        "timerhack",
         "packetfly",
         "hitbox",
         "hitboxes",
@@ -769,12 +769,9 @@ HIGH_SIGNAL_MODULE_NAMES: frozenset[str] = frozenset(
         "cavefinder",
         "basefinder",
         "stashfinder",
-        "newchunks",
         "palettenewchunks",
         "oresim",
         "antivanish",
-        "fullbright",
-        "gammautils",
         "freecam",
         "xray",
         "x-ray",
@@ -792,7 +789,6 @@ HIGH_SIGNAL_MODULE_NAMES: frozenset[str] = frozenset(
         "self_destruct",
         "webaura",
         "web_aura",
-        "creativeflight",
         "coordexploit",
         "highwaybuilder",
         "mace_trigger",
@@ -1098,6 +1094,10 @@ LEGIT_JAVA_PREFIXES: tuple[str, ...] = (
     "de/maxhenkel/",
     "xaero/",
     "journeymap/",
+    "me/steinborn/krypton/",
+    "com/velocitypowered/",
+    "org/jctools/",
+    "com/ibm/asyncutil/",
 )
 
 # Solid opaque blocks that MUST NOT contain transparent pixels in legitimate packs

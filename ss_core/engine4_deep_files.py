@@ -154,6 +154,19 @@ _BENIGN_EMBEDDED_NATIVES: tuple[str, ...] = (
     "flatlaf",
     "libjcocoa",
     "jcocoa",
+    "c2me-opts-natives-math",
+    "velocity-cipher",
+    "velocity-compress",
+    "jlinenative",
+)
+_EMBEDDED_NATIVE_DANGER_MARKERS: tuple[bytes, ...] = (
+    b"Agent_OnLoad",
+    b"Agent_OnAttach",
+    b"RedefineClasses",
+    b"RetransformClasses",
+    b"GetLoadedClasses",
+    b"XTestFakeButtonEvent",
+    b"process_vm_writev",
 )
 _BENIGN_LIB_ONLY_NATIVES: tuple[str, ...] = (
     "libjtracy",
@@ -166,6 +179,12 @@ _BENIGN_UNSAFE_MOD_PREFIXES: tuple[str, ...] = (
     "me/decce/ixeris/",
     "com/ishland/c2me/",
     "org/embeddedt/",
+    "org/jctools/",
+    "com/ibm/asyncutil/",
+    "com/velocitypowered/natives/",
+    "com/llamalad7/mixinextras/",
+    "org/apache/logging/log4j/",
+    "com/google/inject/",
 )
 _STDLIB_NESTED_HINTS: tuple[str, ...] = (
     "kotlin-stdlib",
@@ -776,6 +795,23 @@ def analyze_elf_binary(ctx: ScanContext, path: Path, data: bytes) -> None:
     ):
         return
 
+    # Standalone debuggers / SS tools (e.g., gdb, strace, OceanLinux) legitimately import bare ptrace
+    # without cheat signatures, JNI/JVMTI exports, input injection, or cross-process write syscalls.
+    p_rel = p_low
+    if ctx.root_prefix and p_rel.startswith(str(ctx.root_prefix).lower()):
+        p_rel = p_rel[len(str(ctx.root_prefix)) :]
+    elif ctx.home_dir and p_rel.startswith(str(ctx.home_dir).lower()):
+        p_rel = "/home" + p_rel[len(str(ctx.home_dir)) :]
+    if (
+        not strict
+        and not high_ctx
+        and not jni_exports
+        and len(sym_hits) == 1
+        and sym_hits[0].startswith("ptrace ")
+        and not any(d in p_rel for d in ("/tmp/", "/dev/shm/", "/var/tmp/", "/.minecraft/", "/mods/"))
+    ):
+        return
+
     if strict or (sym_hits and highest_sev in (Severity.CRITICAL, Severity.HIGH)) or (jni_exports and in_suspicious_dir):
         sev = Severity.CRITICAL if (strict or highest_sev == Severity.CRITICAL) else Severity.HIGH
         ev: list[str] = []
@@ -824,6 +860,39 @@ def _extract_utf16le_strings(data: bytes, min_len: int = 6) -> list[str]:
     return out
 
 
+_PE_AMBIGUOUS_VENDOR_TERMS: frozenset[str] = frozenset({"fluxclient"})
+_PE_KNOWN_VENDOR_MARKERS: tuple[str, ...] = (
+    "Roblox Corporation",
+    "Microsoft Corporation",
+    "Valve Corp",
+    "Discord Inc",
+    "Mozilla Corporation",
+    "Google LLC",
+    "NVIDIA Corporation",
+    "Advanced Micro Devices",
+    "Intel Corporation",
+    "JetBrains",
+    "Spotify AB",
+    "Epic Games",
+    "Riot Games",
+)
+_PE_MC_OR_INJECT_CONTEXT: tuple[str, ...] = (
+    "minecraft",
+    "mojang",
+    "javaw.exe",
+    "jvm.dll",
+    "lwjgl",
+    "jni_getcreatedjavavms",
+    "killaura",
+    "autoclicker",
+    "aimassist",
+    "vapev4",
+    "slinky",
+    "wurst",
+    "meteor",
+)
+
+
 def analyze_pe_binary(ctx: ScanContext, path: Path, data: bytes) -> None:
     if len(data) < 64 or not data.startswith(b"MZ"):
         return
@@ -849,11 +918,26 @@ def analyze_pe_binary(ctx: ScanContext, path: Path, data: bytes) -> None:
         and ("CreateRemoteThread" in joined or "NtCreateThreadEx" in joined)
     )
 
-    if strict or (has_jni and (high_ctx or in_suspicious_dir)) or (in_suspicious_dir and (is_injector_combo or (api_hits and high_ctx))):
+    # Disambiguate benign non-Minecraft installers (e.g., RobloxPlayerInstaller.exe using "FluxClient" UI)
+    if (
+        strict
+        and set(strict) <= _PE_AMBIGUOUS_VENDOR_TERMS
+        and not high_ctx
+        and not has_jni
+        and not is_injector_combo
+    ):
+        joined_low = joined.lower()
+        has_mc_ctx = any(tok in joined_low for tok in _PE_MC_OR_INJECT_CONTEXT)
+        has_known_vendor = any(v in joined for v in _PE_KNOWN_VENDOR_MARKERS)
+        if has_known_vendor or not has_mc_ctx:
+            strict = []
+
+    non_ui_high_ctx = [x for x in high_ctx if x not in ("hitbox", "hitboxes")]
+    if strict or (has_jni and (non_ui_high_ctx or in_suspicious_dir)) or (in_suspicious_dir and (is_injector_combo or (api_hits and non_ui_high_ctx))):
         sev = Severity.CRITICAL if (strict or is_injector_combo or (has_jni and in_suspicious_dir)) else Severity.HIGH
         ev: list[str] = []
-        if strict or high_ctx:
-            ev.append(f"Imzalar: {', '.join(strict + high_ctx)}")
+        if strict or non_ui_high_ctx:
+            ev.append(f"Imzalar: {', '.join(strict + non_ui_high_ctx)}")
         if api_hits:
             ev.append(f"Win32 enjeksiyon/makro API: {', '.join(api_hits[:8])}")
         if has_jni:
@@ -1207,8 +1291,48 @@ def _analyze_jar_zip(
                 except (OSError, ValueError, zipfile.BadZipFile, KeyError, zlib.error):
                     pass
 
+        # Package + behavioral verification for Andrew Steinborn's legit Krypton optimization mod
+        # (prevents false positive on 'KryptonClientInitializer' colliding with DonutSMP 'kryptonclient' cheat,
+        # while catching any spoofed krypton.jar containing foreign/cheat classes!)
+        all_class_names_pre = [
+            inf.filename for inf in infos if (not inf.is_dir()) and inf.filename.lower().endswith(".class")
+        ]
+        _krypton_allowed_pkgs = (
+            "me/steinborn/krypton/",
+            "com/velocitypowered/",
+            "io/netty/",
+            "org/slf4j/",
+            "META-INF/",
+        )
+        is_verified_legit_krypton = (
+            any(m.lower() == "krypton" for m in mod_ids)
+            and any(c.startswith("me/steinborn/krypton/") for c in all_class_names_pre)
+            and all(c.startswith(_krypton_allowed_pkgs) for c in all_class_names_pre)
+        )
+        is_verified_spark_jar = (
+            bool(all_class_names_pre)
+            and any(c.startswith("me/lucko/spark/") for c in all_class_names_pre)
+            and all(c.startswith(("me/lucko/spark/", "net/kyori/", "org/slf4j/", "META-INF/")) for c in all_class_names_pre)
+        )
+        is_mc_or_paper_server_jar = (
+            ("version.json" in names_lower and any(c.startswith("net/minecraft/") for c in all_class_names_pre))
+            or any(c.startswith("io/papermc/paper/antixray/") for c in all_class_names_pre)
+        )
+        is_pure_server_plugin = (
+            any(k in names_lower for k in ("plugin.yml", "paper-plugin.yml", "bungee.yml", "velocity-plugin.json"))
+            and not mod_ids
+            and not manifest_agents
+            and not any("mixin" in n and n.endswith(".json") for n in names_lower)
+            and not any(
+                m in display_path.replace("\\", "/").lower()
+                for m in ("/.minecraft/", "/.lunarclient/", "/prismlauncher/", "/modrinthapp/", "/feather/")
+            )
+        )
+
         meta_joined = " ".join(mod_ids + mod_names + mod_entrypoints)
         strict_m, high_m, _ = match_cheat_signatures(meta_joined)
+        if is_verified_legit_krypton:
+            strict_m = [x for x in strict_m if x not in ("kryptonclient", "krypton-client")]
         if strict_m or high_m:
             ctx.add_finding(
                 Finding(
@@ -1266,6 +1390,29 @@ def _analyze_jar_zip(
                 )
             )
 
+        embedded_native_infos: list[zipfile.ZipInfo] = []
+        dp_norm = display_path.replace("\\", "/").lower()
+        is_jdk_distro_zip = (
+            dp_norm.endswith(".zip")
+            and any(n.endswith(("/bin/java.exe", "/bin/java")) for n in names_lower)
+            and any(n.endswith(("/lib/modules", "/jre/lib/rt.jar", "/release")) for n in names_lower)
+        )
+        is_fabric_installer_jar = "net/fabricmc/installer/main.class" in names_lower
+        _JDK_STD_JAR_NAMES = (
+            "/jrt-fs.jar",
+            "/jconsole.jar",
+            "/management-agent.jar",
+            "/sa-jdi.jar",
+            "/jfr.jar",
+            "/sunec.jar",
+            "/sunmscapi.jar",
+            "/sunpkcs11.jar",
+            "/access-bridge-64.jar",
+            "/rt.jar",
+            "/tools.jar",
+            "/charsets.jar",
+            "/jsse.jar",
+        )
         # 5c. Iterate entries for Mixins, embedded natives, .class constant pools, nested JARs
         class_infos: list[zipfile.ZipInfo] = []
         for info in infos:
@@ -1275,10 +1422,15 @@ def _analyze_jar_zip(
             fn_low = fn.lower()
 
             if fn_low.endswith((".so", ".dll", ".dylib", ".exe")):
+                if is_jdk_distro_zip and ("/bin/" in fn_low or "/lib/" in fn_low):
+                    continue
                 embedded_natives.append(f"{fn} ({info.file_size} byte)")
+                embedded_native_infos.append(info)
                 continue
 
             if fn_low.endswith(".jar") and depth < 2 and info.file_size <= 16 * 1024 * 1024:
+                if is_jdk_distro_zip and fn_low.endswith(_JDK_STD_JAR_NAMES):
+                    continue
                 try:
                     nested_bytes = safe_zip_read(zf, info, 16 * 1024 * 1024)
                     _analyze_jar_bytes(
@@ -1305,14 +1457,20 @@ def _analyze_jar_zip(
             if fn_low.endswith(".class") and info.file_size <= 2 * 1024 * 1024:
                 class_infos.append(info)
 
-        if class_infos:
+        if class_infos and not is_pure_server_plugin:
             all_cfns = "\n".join(ci.filename for ci in class_infos)
             if _OBF_CTRL_RE.search(all_cfns):
                 control_char_classes += sum(1 for ci in class_infos if _OBF_CTRL_RE.search(ci.filename))
             s_all, h_all, _ = match_cheat_signatures(all_cfns)
+            if is_verified_legit_krypton:
+                s_all = [x for x in s_all if x not in ("kryptonclient", "krypton-client")]
             if s_all or any(x not in ("hitbox", "hitboxes") for x in h_all) or len(h_all) >= 2:
                 for ci in class_infos:
+                    if ci.filename.startswith("io/papermc/paper/") and "antixray" in ci.filename.lower():
+                        continue
                     s_fn, h_fn, _ = match_cheat_signatures(ci.filename)
+                    if is_verified_legit_krypton:
+                        s_fn = [x for x in s_fn if x not in ("kryptonclient", "krypton-client")]
                     non_ui_fn_h = [x for x in h_fn if x not in ("hitbox", "hitboxes")]
                     if s_fn or non_ui_fn_h or len(h_fn) >= 2:
                         class_cheat_hits.append(f"Sinif '{ci.filename}' [{','.join(s_fn + h_fn)}]")
@@ -1322,6 +1480,7 @@ def _analyze_jar_zip(
         dp_norm = display_path.replace("\\", "/").lower()
         is_stdlib_jar = (
             "/libraries/" in dp_norm
+            or is_mc_or_paper_server_jar
             or (
                 actual_file_path is not None
                 and actual_file_path.parent.parent.name == "versions"
@@ -1380,6 +1539,8 @@ def _analyze_jar_zip(
             s_cp, h_cp, l_cp = match_cheat_signatures(cp_blob_clean)
             if s_raw:
                 s_cp = sorted(set(s_cp) | set(s_raw))
+            if is_verified_legit_krypton:
+                s_cp = [x for x in s_cp if x not in ("kryptonclient", "krypton-client")]
             blatant_h_raw = [x for x in h_raw if x not in _ambig_single_high]
             if blatant_h_raw:
                 h_cp = sorted(set(h_cp) | set(blatant_h_raw))
@@ -1389,7 +1550,7 @@ def _analyze_jar_zip(
                 not s_cp
                 and len(h_cp) == 1
                 and h_cp[0] in ("hitbox", "hitboxes")
-                and set(l_cp) <= {"nametags", "tracers", "reach"}
+                and set(l_cp) <= {"nametags", "tracers", "reach", "velocity"}
             )
             if (
                 s_cp
@@ -1398,7 +1559,12 @@ def _analyze_jar_zip(
                 or (non_ui_cp_h and len(h_cp) >= 2)
                 or (h_cp and l_cp)
             ) and not is_benign_entity_cfg:
-                if len(class_cheat_hits) < 15:
+                if is_pure_server_plugin and not any(
+                    c.startswith(("net/minecraft/client/", "net/fabricmc/", "net/minecraftforge/", "net/neoforged/"))
+                    for c in parsed["class_refs"]
+                ):
+                    pass
+                elif len(class_cheat_hits) < 15:
                     class_cheat_hits.append(
                         f"{fn} ConstantPool [{', '.join((s_cp + h_cp + l_cp)[:6])}]"
                     )
@@ -1410,11 +1576,14 @@ def _analyze_jar_zip(
                 cls_joined = "\n".join(parsed["class_refs"])
                 if parsed["method_refs"] or (cls_joined and _SUSP_API_RE.search(cls_joined)):
                     joined_mrefs = "\n".join(parsed["method_refs"]) + "\n" + cls_joined
-                    is_junixsocket = fn.startswith("org/newsclub/net/unix/")
-                    is_benign_unsafe = fn.startswith(_BENIGN_UNSAFE_MOD_PREFIXES)
-                    is_unilib_reflect = is_unilib_mod and fn.startswith("unilib/external/net/lenni0451/reflect/")
+                    fn_logical = re.sub(r"^META-INF/versions/\d+/", "", fn)
+                    is_junixsocket = fn_logical.startswith("org/newsclub/net/unix/")
+                    is_benign_unsafe = fn_logical.startswith(_BENIGN_UNSAFE_MOD_PREFIXES)
+                    is_unilib_reflect = is_unilib_mod and fn_logical.startswith("unilib/external/net/lenni0451/reflect/")
                     for api_sym, (sev_s, desc) in JVM_SUSPICIOUS_API_SYMBOLS.items():
                         if api_sym in joined_mrefs:
+                            if is_verified_spark_jar and fn_logical.startswith("me/lucko/spark/"):
+                                continue
                             if (is_stdlib_jar or is_junixsocket) and api_sym in (
                                 "sun/misc/Unsafe",
                                 "jdk/internal/misc/Unsafe",
@@ -1432,7 +1601,18 @@ def _analyze_jar_zip(
                                 continue
                             if fn.startswith("me/decce/ixeris/") and api_sym == "defineHiddenClass":
                                 continue
-                            if fn.startswith("net/lostluma/battery/impl/util/Natives") and api_sym == "java/lang/System.load":
+                            if fn.startswith(
+                                (
+                                    "net/lostluma/battery/impl/util/Natives",
+                                    "com/velocitypowered/natives/util/Natives",
+                                    "net/fabricmc/installer/launcher/NativesHelper",
+                                )
+                            ) and api_sym == "java/lang/System.load":
+                                continue
+                            if fn.endswith(("/sqlite/core/NativeDB.class", "/sqlite/SQLiteJDBCLoader.class")) and api_sym in (
+                                "java/lang/System.load",
+                                "java/lang/System.loadLibrary",
+                            ):
                                 continue
                             if is_unilib_reflect:
                                 if len(benign_reflect_hits) < 4:
@@ -1441,26 +1621,67 @@ def _analyze_jar_zip(
                             if len(class_api_hits) < 12:
                                 class_api_hits.append(f"[{sev_s}] {fn} -> {api_sym} ({desc})")
 
-        if embedded_natives:
-            suspicious_natives = [
-                n
-                for n in embedded_natives
-                if not any(ok in n.lower() for ok in _BENIGN_EMBEDDED_NATIVES)
-                and not (
-                    ("/libraries/" in dp_norm or ("/.lunarclient/" in dp_norm and "/mods/" not in dp_norm))
-                    and any(ok in n.lower() for ok in _BENIGN_LIB_ONLY_NATIVES)
+        is_java_archive = (
+            dp_norm.endswith(".jar")
+            or bool(class_infos)
+            or bool(mod_ids)
+            or "meta-inf/manifest.mf" in names_lower
+        )
+        if embedded_native_infos and not is_verified_spark_jar:
+            suspicious_natives: list[str] = []
+            trojanized_native = False
+            for ninfo in embedded_native_infos:
+                nlabel = f"{ninfo.filename} ({ninfo.file_size} byte)"
+                nlow = ninfo.filename.lower()
+                is_known_name = (
+                    any(ok in nlow for ok in _BENIGN_EMBEDDED_NATIVES)
+                    or (
+                        ("/libraries/" in dp_norm or ("/.lunarclient/" in dp_norm and "/mods/" not in dp_norm))
+                        and any(ok in nlow for ok in _BENIGN_LIB_ONLY_NATIVES)
+                    )
+                    or (is_fabric_installer_jar and nlow.startswith("natives/") and nlow.endswith((".dll", ".dylib", ".so")))
                 )
-            ]
+                # Inspect actual binary bytes of embedded native so trojanized lwjgl/velocity/c2me DLLs are STILL caught!
+                nbad: list[str] = []
+                ndata = b""
+                try:
+                    ndata = safe_zip_read(zf, ninfo, 4 * 1024 * 1024)
+                    for mk in _EMBEDDED_NATIVE_DANGER_MARKERS:
+                        if mk in ndata:
+                            # Official LWJGL liblwjgl.so wraps <sys/uio.h> via Java_org_lwjgl_system_linux_UIO_nprocess_1vm_1writev
+                            if (
+                                mk == b"process_vm_writev"
+                                and b"Java_org_lwjgl_system_linux_UIO_nprocess_1vm_1writev" in ndata
+                            ):
+                                continue
+                            nbad.append(mk.decode("ascii", errors="replace"))
+                    if not nbad and not is_known_name:
+                        s_nat, _, _ = match_cheat_signatures(ndata.decode("latin-1", errors="ignore"))
+                        if s_nat:
+                            nbad.extend(s_nat[:3])
+                except (OSError, ValueError, zipfile.BadZipFile, zlib.error):
+                    pass
+                if nbad:
+                    trojanized_native = True
+                    suspicious_natives.append(f"{nlabel} [TEHLİKELİ: {', '.join(nbad[:4])}]")
+                elif is_java_archive and not is_known_name:
+                    suspicious_natives.append(nlabel)
+                elif not is_java_archive and ndata:
+                    # Plain .zip archive (not a .jar): inspect embedded PE/ELF directly rather than flagging as a JAR native
+                    if ndata.startswith(b"MZ"):
+                        analyze_pe_binary(ctx, Path(f"{display_path}!/{ninfo.filename}"), ndata)
+                    elif ndata.startswith(b"\x7fELF"):
+                        analyze_elf_binary(ctx, Path(f"{display_path}!/{ninfo.filename}"), ndata)
             if suspicious_natives:
                 ctx.add_finding(
                     Finding(
                         rule_id="E4-JAR-EMBEDDED-NATIVE",
                         engine=ENGINE_NAME,
-                        severity=Severity.HIGH,
-                        confidence=Confidence.HIGH,
+                        severity=Severity.CRITICAL if trojanized_native else Severity.HIGH,
+                        confidence=Confidence.CONFIRMED if trojanized_native else Confidence.HIGH,
                         category="Embedded Native Binary in JAR",
                         title=f".jar icinde gomulu native kutuphane (.so/.dll/.exe): {os.path.basename(display_path)}",
-                        description="Standart LWJGL/ses disinda bir .jar arsivinin icinde derlenmis C/C++ kutuphanesi tasiyor.",
+                        description="Standart LWJGL/ses/optimizasyon disinda (veya enjeksiyon sembollu) derlenmis C/C++ kutuphanesi tasiyor.",
                         evidence=suspicious_natives[:10],
                         path=display_path,
                     )

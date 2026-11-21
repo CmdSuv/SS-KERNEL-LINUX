@@ -30,12 +30,18 @@ _FORENSIC_TAMPERING_RULES = {
     "E1-HIST-DEVNULL",
     "E1-HIST-ANTIFORENSIC-CMD",
     "E1-HIST-TIMESTOMP",
+    "E1-HIST-MISSING",
+    "E1-HIST-TRUNCATED",
     "E1-RC-HIST-DISABLE",
     "E1-RC-ANTIFORENSIC-HOOK",
     "E1-REBOOT-RECENT",
     "E1-JOURNAL-CLEARED",
     "E1-TIMESTOMP-ANOMALY",
+    "E1-XBEL-DEVNULL",
+    "E1-XBEL-WIPED",
+    "E1-PKG-LOG-TAMPERED",
     "E4-TIMESTOMP-ANOMALY",
+    "E4-TIME-FUTURE",
     "E5-LOG-MISSING-LATEST",
     "E5-LOG-ZEROED",
     "E5-LOG-MISSING-CHEAT-MOD",
@@ -76,24 +82,49 @@ _KERNEL_INTEGRITY_RULES = {
 }
 
 _CHEAT_EVIDENCE_EXPLICIT = {
+    "E1-HIST-CHEAT-CMD",
+    "E1-ENV-LD-PRELOAD",
+    "E1-ENV-LD-AUDIT",
+    "E1-ETC-LD-PRELOAD",
+    "E1-PATH-SHADOW-ELF",
+    "E1-PATH-SHADOW-SCRIPT",
     "E2-FD-DELETED-FILE",
+    "E2-FD-CHEAT-PATH",
     "E2-FD-UINPUT-ACCESS",
     "E2-PROC-LDPRELOAD",
     "E2-PROC-LDAUDIT",
+    "E2-PROC-LDLIBPATH-TMP",
     "E2-PROC-JAVA-ENV-INJECT",
     "E2-PROC-CHEAT-NAME",
     "E2-PROC-MASQUERADE",
+    "E2-PROC-MEMFD-EXE",
+    "E2-PROC-TMP-EXE",
+    "E2-PROC-TRACERPID",
     "E2-HSPERF-SUSPICIOUS",
+    "E4-ELF-SUSPICIOUS",
+    "E4-FILE-CHEAT-NAME",
+    "E4-HIDDEN-MC-ARTIFACT",
+    "E4-MC-SUSPICIOUS-SYMLINK",
     "E4-STANDALONE-CLASS-CHEAT",
     "E4-SCRIPT-CHEAT-OR-ANTIFORENSIC",
     "E4-FILE-RESTRICTED-MOD",
     "E4-EXT-SPOOF",
     "E4-POLYGLOT-PAYLOAD",
     "E4-RESOURCEPACK-XRAY",
+    "E4-RP-XRAY-TEXTURE",
+    "E4-RP-XRAY-EMPTY-MODEL",
+    "E4-RP-XRAY-BLOCKSTATE",
+    "E4-RP-FULLBRIGHT-LIGHTMAP",
+    "E4-SHADER-XRAY",
     "E4-XATTR-CHEAT-URL",
     "E4-PE-CHEAT-OR-INJECTOR",
+    "E6-BROWSER-BOOKMARK-CHEAT",
     "E6-BROWSER-CHEAT-URL",
     "E6-BROWSER-CHEAT-DOWNLOAD",
+    "E6-CLIPBOARD-HIT",
+    "E6-JAVA-USERPREFS-CHEAT",
+    "E6-PERSISTENCE-AUTOSTART",
+    "E6-XBEL-CHEAT-FILE",
     "E7-CHEAT-PORT-LISTEN",
     "E7-HOSTS-SPOOF",
     "E8-CORR-STEALTH-MACRO",
@@ -102,6 +133,7 @@ _CHEAT_EVIDENCE_EXPLICIT = {
     "E8-CORR-ACQUISITION-CHAIN",
     "E8-CORR-JVM-INJECT-CHAIN",
     "E8-CORR-KERNEL-FILELESS",
+    "E9-AUDIT-INJECT-SYSCALL",
     "E9-KERNEL-VMA-REFLECTIVE-ELF",
     "E9-KERNEL-VMA-JNI-AGENT",
     "E9-KERNEL-VMA-PACKED-CODE",
@@ -132,6 +164,11 @@ def _classify_domain(f: Finding) -> str:
         if f.metadata.get("remapper_daemon") or f.severity.rank <= Severity.LOW.rank:
             return "os_security"
         return "cheat_evidence"
+    if rid == "E2-PROC-DELETED-EXE":
+        ev_blob = " ".join(str(x) for x in f.evidence[:2])
+        if "exe=/usr/" in ev_blob or "exe=/lib" in ev_blob or "exe=/opt/" in ev_blob:
+            return "os_security"
+        return "cheat_evidence"
     if rid == "E2-HSPERF-SUSPICIOUS" and f.severity == Severity.INFO:
         return "os_security"
     if (
@@ -139,7 +176,7 @@ def _classify_domain(f: Finding) -> str:
         or rid.startswith(("E2-RAM-", "E2-MAP-", "E2-JVM-", "E2-JCMD-", "E4-JAR-", "E5-", "E6-WINE-"))
         or (
             rid.startswith("E3-")
-            and rid not in ("E3-UINPUT-WORLD-WRITABLE", "E3-UINPUT-PERM")
+            and rid not in ("E3-UINPUT-WRITABLE", "E3-UINPUT-WORLD-WRITABLE", "E3-UINPUT-PERM")
         )
     ):
         return "cheat_evidence"
@@ -216,6 +253,10 @@ def correlate_findings(ctx: ScanContext) -> None:
         "E1-HIST-DEVNULL",
         "E1-HIST-ANTIFORENSIC-CMD",
         "E1-HIST-TIMESTOMP",
+        "E1-HIST-TRUNCATED",
+        "E1-XBEL-DEVNULL",
+        "E1-XBEL-WIPED",
+        "E1-PKG-LOG-TAMPERED",
         "E1-RC-HIST-DISABLE",
         "E1-RC-ANTIFORENSIC-HOOK",
         "E1-REBOOT-RECENT",
@@ -404,6 +445,9 @@ def correlate_findings(ctx: ScanContext) -> None:
         "E2-JVM-PERF-DISABLE",
         "E2-JCMD-FLAGS",
         "E2-JCMD-ATTACH-LOADED",
+        "E1-ENV-LD-PRELOAD",
+        "E1-ENV-LD-AUDIT",
+        "E1-ETC-LD-PRELOAD",
         "E1-RC-LDPRELOAD",
         "E1-RC-LDAUDIT",
         "E1-RC-JAVA-TOOL-OPTS",
@@ -1464,12 +1508,39 @@ def render_txt_report(payload: dict[str, Any], saved_path: Path | None = None) -
     return "\n".join(lines) + "\n"
 
 
-def render_html_report(payload: dict[str, Any]) -> str:
+def _safe_json_for_html_script(obj: Any) -> str:
+    """Serialize JSON safely for embedding inside an HTML <script type='application/json'> block."""
+    raw = json.dumps(obj, ensure_ascii=False)
+    return (
+        raw.replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def render_html_report(payload: dict[str, Any], saved_path: Path | None = None) -> str:
     ass = payload["assessment"]
     counts = ass["counts"]
     score = ass["risk_score"]
     vlevel = ass["verdict_level"]
     domain_scores = ass.get("domain_scores") or {}
+    telem = payload.get("telemetry", {}) or {}
+    findings = payload.get("findings", []) or []
+    timings = telem.get("engine_timings_sec", {}) or {}
+    total_dur = round(sum(float(v) for v in timings.values() if isinstance(v, (int, float))), 3)
+    local_now = payload.get("generated_local") or datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    deep_count = telem.get("engine4_files_deep_scanned", 0)
+    total_procs = telem.get("total_processes", 0)
+    java_pids = telem.get("java_pids", []) or []
+    mc_pids = telem.get("minecraft_pids", []) or []
+    mc_inst = telem.get("minecraft_instances", []) or []
+    lkm_act = telem.get("kernel_lkm_active", False)
+    iommu_info = telem.get("iommu_compliance") or {}
+    iommu_lbl = "Aktif" if isinstance(iommu_info, dict) and iommu_info.get("iommu_active") else "Kapalı / Belirsiz"
+
     badge_color = {
         "CRITICAL": "#ef4444",
         "HIGH": "#f97316",
@@ -1482,43 +1553,70 @@ def render_html_report(payload: dict[str, Any]) -> str:
         return html.escape(str(val), quote=True)
 
     domain_labels = {
-        "cheat_evidence": "Hile Kanit Duzeyi",
-        "forensic_tampering": "Adli Iz Manipulasyonu",
-        "kernel_integrity": "Cekirdek Butunlugu",
-        "dma_hardware": "DMA / Donanim Maruziyeti",
-        "os_security": "IS Guvenlik Riski",
-        "scan_coverage": "Tarama Kapsami / Kalitesi",
+        "cheat_evidence": "Hile Kanıt Düzeyi",
+        "forensic_tampering": "Adli İz Manipülasyonu",
+        "kernel_integrity": "Çekirdek Bütünlüğü",
+        "dma_hardware": "DMA / Donanım Maruziyeti",
+        "os_security": "İS Güvenlik Riski",
+        "scan_coverage": "Tarama Kapsamı / Kalitesi",
     }
 
+    sev_labels_tr = {
+        "CRITICAL": "KRİTİK",
+        "HIGH": "YÜKSEK",
+        "MEDIUM": "ORTA",
+        "LOW": "DÜŞÜK",
+        "INFO": "BİLGİ",
+    }
+
+    engines_seen: list[str] = []
+    seen_eng_set: set[str] = set()
     finding_cards: list[str] = []
-    for f in payload["findings"]:
-        sev = f["severity"]
+    priority_items: list[str] = []
+
+    for idx, f in enumerate(findings, 1):
+        sev = str(f["severity"])
+        eng = str(f["engine"])
+        if eng not in seen_eng_set:
+            seen_eng_set.add(eng)
+            engines_seen.append(eng)
         raw_evs = f.get("evidence", []) or []
-        ev_items_list = [f"<li><code>{esc(e)}</code></li>" for e in raw_evs[:50]]
-        if len(raw_evs) > 50:
-            ev_items_list.append(f"<li><code>... (+{len(raw_evs) - 50} ek kanit JSON raporunda)</code></li>")
-        ev_items = "".join(ev_items_list)
+        shown_evs = raw_evs[:8]
+        extra_evs = raw_evs[8:50]
+        ev_items = "".join(f"<li><code>{esc(e)}</code></li>" for e in shown_evs)
+        extra_html = ""
+        if extra_evs:
+            more_li = "".join(f"<li><code>{esc(e)}</code></li>" for e in extra_evs)
+            if len(raw_evs) > 50:
+                more_li += f"<li><code>... (+{len(raw_evs) - 50} ek kanıt JSON raporunda)</code></li>"
+            extra_html = (
+                f"<details class='ev-more'><summary>+{len(raw_evs) - len(shown_evs)} ek kanıtı göster</summary>"
+                f"<ul class='ev-list'>{more_li}</ul></details>"
+            )
         path_html = f"<div><strong>Yol:</strong> <code>{esc(f['path'])}</code></div>" if f.get("path") else ""
         pid_html = f"<div><strong>PID:</strong> <code>{esc(f['pid'])}</code></div>" if f.get("pid") is not None else ""
-        dom_key = f.get("domain", "")
-        dom_html = f"<div><strong>Alan:</strong> {esc(domain_labels.get(dom_key, dom_key))}</div>" if dom_key else ""
+        dom_key = str(f.get("domain", ""))
+        dom_lbl = domain_labels.get(dom_key, dom_key)
+        dom_html = f"<div><strong>Alan:</strong> {esc(dom_lbl)}</div>" if dom_key else ""
         rec_html = (
-            f"<div class='rec'><strong>SS Kontrol Onerisi:</strong> {esc(f['recommendation'])}</div>"
+            f"<div class='rec'><strong>SS Kontrol Önerisi:</strong> {esc(f['recommendation'])}</div>"
             if f.get("recommendation")
             else ""
         )
         search_blob = (
             f"{f.get('rule_id', '')} {f.get('title', '')} {f.get('description', '')} "
-            f"{f.get('path') or ''} {' '.join(str(x) for x in raw_evs[:30])}"
+            f"{f.get('category', '')} {dom_lbl} {eng} {f.get('path') or ''} "
+            f"{' '.join(str(x) for x in raw_evs[:30])}"
         ).lower()
+        card_id = f"finding-{idx}"
         finding_cards.append(
             f"""
-            <article class="card sev-{esc(sev)}" data-sev="{esc(sev)}" data-engine="{esc(f['engine'])}" data-search="{esc(search_blob)}">
+            <article id="{card_id}" class="card sev-{esc(sev)}" data-sev="{esc(sev)}" data-engine="{esc(eng)}" data-domain="{esc(dom_key)}" data-search="{esc(search_blob)}">
               <div class="card-head">
-                <span class="pill pill-{esc(sev)}">{esc(sev)}</span>
+                <span class="pill pill-{esc(sev)}">{esc(sev_labels_tr.get(sev, sev))} ({esc(sev)})</span>
                 <span class="pill pill-conf">{esc(f['confidence'])}</span>
                 <span class="rule-id">{esc(f['rule_id'])}</span>
-                <span class="eng-tag">{esc(f['engine'])}</span>
+                <span class="eng-tag">{esc(eng)}</span>
               </div>
               <h3>{esc(f['title'])}</h3>
               <p class="desc">{esc(f['description'])}</p>
@@ -1530,20 +1628,47 @@ def render_html_report(payload: dict[str, Any]) -> str:
                 {pid_html}
               </div>
               {f"<ul class='ev-list'>{ev_items}</ul>" if ev_items else ""}
+              {extra_html}
               {rec_html}
             </article>
             """
         )
+        if sev in ("CRITICAL", "HIGH", "MEDIUM"):
+            loc = f.get("path") or (f"Süreç PID {f['pid']}" if f.get("pid") is not None else "Sistem / Çekirdek / Bellek")
+            ev0 = f"<div class='prio-ev'><code>{esc(raw_evs[0])}</code></div>" if raw_evs else ""
+            priority_items.append(
+                f"<a class='prio-item prio-{esc(sev)}' href='#{card_id}' onclick=\"jumpToFinding('{card_id}')\">"
+                f"<div class='prio-top'><span class='pill pill-{esc(sev)}'>{esc(sev_labels_tr.get(sev, sev))}</span>"
+                f"<span class='prio-title'>{esc(f['title'])}</span>"
+                f"<span class='rule-id'>{esc(f['rule_id'])} · Skor {esc(f['effective_score'])}</span></div>"
+                f"<div class='prio-loc'>Konum: <code>{esc(loc)}</code></div>{ev0}</a>"
+            )
+
+    priority_section_html = (
+        f"<section id='priority' class='panel'><h2>1. Öncelikli Bulgular Özeti ({len(priority_items)} tespit)</h2>"
+        f"<div class='prio-list'>{''.join(priority_items)}</div></section>"
+        if priority_items
+        else "<section id='priority' class='panel clean-box'><h2>1. Öncelikli Bulgular Özeti</h2>"
+        "<p class='clean-msg'>[TEMİZ] Kritik, yüksek veya orta riskli herhangi bir hile, enjeksiyon veya makro bulgusu saptanmadı.</p></section>"
+    )
 
     domain_cards_html = ""
     if domain_scores:
         d_items = []
         for dk, dlbl in domain_labels.items():
-            dval = domain_scores.get(dk, 100 if dk == "scan_coverage" else 0)
+            dval = int(domain_scores.get(dk, 100 if dk == "scan_coverage" else 0))
+            if dk == "scan_coverage":
+                bar_col = "#22c55e" if dval >= 85 else ("#eab308" if dval >= 70 else "#ef4444")
+            else:
+                bar_col = "#ef4444" if dval >= 65 else ("#f97316" if dval >= 35 else ("#eab308" if dval >= 15 else "#22c55e"))
             d_items.append(
-                f"<div class='stat'><div class='num'>{esc(dval)}</div><div class='lbl'>{esc(dlbl)}</div></div>"
+                f"<div class='stat'>"
+                f"<div class='stat-top'><span class='num' style='color:{bar_col}'>{dval}</span><span class='stat-unit'>/100</span></div>"
+                f"<div class='lbl'>{esc(dlbl)}</div>"
+                f"<div class='bar-track'><div class='bar-fill' style='width:{max(0, min(100, dval))}%;background:{bar_col}'></div></div>"
+                f"</div>"
             )
-        domain_cards_html = f"<section class='stats'>{''.join(d_items)}</section>"
+        domain_cards_html = f"<section class='stats domain-grid'>{''.join(d_items)}</section>"
 
     breakdown_rows = []
     for br in (ass.get("score_breakdown") or [])[:30]:
@@ -1552,16 +1677,33 @@ def render_html_report(payload: dict[str, Any]) -> str:
             f"<td><code>{esc(br.get('rule_id', ''))}</code></td>"
             f"<td>{esc(domain_labels.get(str(br.get('domain', '')), str(br.get('domain', ''))))}</td>"
             f"<td><code>{esc(br.get('subject', ''))}</code></td>"
-            f"<td>{esc(br.get('raw_score', 0))} x {esc(br.get('multiplier', 1.0))} = <strong>{esc(br.get('contributed', 0))}</strong></td>"
+            f"<td>{esc(br.get('raw_score', 0))} × {esc(br.get('multiplier', 1.0))} = <strong>+{esc(br.get('contributed', 0))}</strong></td>"
             "</tr>"
         )
     breakdown_html = (
-        f"<section class='panel'><h2>Risk Puanlama Aciklamasi (Ilk 30 Katki)</h2>"
-        f"<table><tr><th>Kural</th><th>Alan</th><th>Konu / Hedef</th><th>Puan Katkisi</th></tr>"
-        f"{''.join(breakdown_rows)}</table></section>"
+        f"<section id='scoring' class='panel'><h2>Risk Puanlama Açıklaması (İlk 30 Katkı)</h2>"
+        f"<div class='table-wrap'><table><thead><tr><th>Kural</th><th>Alan</th><th>Konu / Hedef</th><th>Puan Katkısı</th></tr></thead>"
+        f"<tbody>{''.join(breakdown_rows)}</tbody></table></div></section>"
         if breakdown_rows
         else ""
     )
+
+    eng_status_rows: list[str] = []
+    engine_status = payload.get("engine_status") or {}
+    if isinstance(engine_status, dict):
+        for ecode in sorted(engine_status.keys()):
+            einfo = engine_status[ecode]
+            if isinstance(einfo, dict):
+                st = str(einfo.get("status", "?")).upper()
+                st_cls = "st-ok" if st == "COMPLETED" else ("st-warn" if st in ("PARTIAL", "SKIPPED") else "st-err")
+                dur = timings.get(ecode)
+                dur_str = f"{dur} sn" if dur is not None else "-"
+                eng_status_rows.append(
+                    f"<tr><td><code>{esc(ecode)}</code> · {esc(_ENGINE_TITLES.get(ecode, ecode))}</td>"
+                    f"<td><span class='st-pill {st_cls}'>{esc(st)}</span></td>"
+                    f"<td><code>{esc(dur_str)}</code></td>"
+                    f"<td>{esc(einfo.get('detail', ''))}</td></tr>"
+                )
 
     cov_rows: list[str] = []
     coverage_map = payload.get("coverage") or {}
@@ -1569,138 +1711,353 @@ def render_html_report(payload: dict[str, Any]) -> str:
         for comp in sorted(coverage_map.keys()):
             cinfo = coverage_map[comp]
             if isinstance(cinfo, dict):
+                st = str(cinfo.get("status", "?")).upper()
+                st_cls = "st-ok" if st == "COMPLETED" else ("st-warn" if st in ("PARTIAL", "SKIPPED", "UNSUPPORTED") else "st-err")
                 cov_rows.append(
-                    f"<tr><td><code>{esc(comp)}</code></td><td><code>{esc(cinfo.get('status', ''))}</code></td><td>{esc(cinfo.get('detail', ''))}</td></tr>"
+                    f"<tr><td><code>{esc(comp)}</code></td>"
+                    f"<td><span class='st-pill {st_cls}'>{esc(st)}</span></td>"
+                    f"<td>{esc(cinfo.get('detail', ''))}</td></tr>"
                 )
-    cov_html = (
-        f"<section class='panel'><h2>Tarama Kapsami ve Veri Kalitesi ({esc(ass.get('scan_quality', 100))}/100)</h2>"
-        f"<table><tr><th>Bilesen</th><th>Durum</th><th>Detay</th></tr>{''.join(cov_rows)}</table></section>"
-        if cov_rows
+
+    gaps = ass.get("coverage_gaps") or []
+    gaps_html = ""
+    if gaps:
+        gap_li = "".join(f"<li><code>{esc(g)}</code></li>" for g in gaps)
+        gaps_html = f"<div class='warn-box'><strong>Kapsam Notları / Eksikler:</strong><ul>{gap_li}</ul></div>"
+
+    regions_blocks: list[str] = []
+    scanned_regions = telem.get("scanned_regions") or {}
+    if isinstance(scanned_regions, dict) and scanned_regions:
+        for eng_code in sorted(scanned_regions.keys()):
+            dur = timings.get(eng_code)
+            dur_lbl = f" ({dur} sn)" if dur is not None else ""
+            li_html = "".join(f"<li><code>{esc(r)}</code></li>" for r in scanned_regions[eng_code])
+            regions_blocks.append(
+                f"<div class='reg-group'><h4>{esc(_ENGINE_TITLES.get(eng_code, eng_code))}{esc(dur_lbl)}</h4><ul>{li_html}</ul></div>"
+            )
+    if telem.get("engine4_mc_dirs_scanned"):
+        li_mc = "".join(f"<li><code>{esc(d)}</code></li>" for d in telem["engine4_mc_dirs_scanned"])
+        regions_blocks.append(f"<div class='reg-group'><h4>Keşfedilen Minecraft Kök Dizinleri</h4><ul>{li_mc}</ul></div>")
+    if telem.get("engine4_hot_dirs_scanned"):
+        li_hd = "".join(f"<li><code>{esc(d)}</code></li>" for d in telem["engine4_hot_dirs_scanned"])
+        regions_blocks.append(f"<div class='reg-group'><h4>Taranan Sıcak Klasörler</h4><ul>{li_hd}</ul></div>")
+    ram_bytes = telem.get("ram_scanned_bytes") or {}
+    if isinstance(ram_bytes, dict) and ram_bytes:
+        total_mb = round(sum(int(v) for v in ram_bytes.values()) / (1024 * 1024), 2)
+        ram_items = sorted(ram_bytes.items(), key=lambda kv: int(kv[1]), reverse=True)[:25]
+        li_ram = "".join(
+            f"<li><code>PID {esc(rpid)}: {round(int(rb) / (1024 * 1024), 2)} MB ({esc(rb)} bayt)</code></li>"
+            for rpid, rb in ram_items
+        )
+        regions_blocks.append(
+            f"<div class='reg-group'><h4>Canlı RAM Taraması ({len(ram_bytes)} süreç, {total_mb} MB)</h4><ul>{li_ram}</ul></div>"
+        )
+
+    regions_details_html = (
+        f"<details class='sub-details'><summary>Taranan Bölgeler, Klasörler ve RAM Kapsamı</summary>"
+        f"<div class='reg-grid'>{''.join(regions_blocks)}</div></details>"
+        if regions_blocks
         else ""
     )
 
-    telem_row_list: list[str] = []
-    for grp_title, rows in _build_structured_telemetry_groups(payload["telemetry"]):
-        telem_row_list.append(
-            f"<tr><td colspan='2' style='background:#0f172a;color:#93c5fd;font-weight:700'>{esc(grp_title)}</td></tr>"
+    cov_html = (
+        f"<section id='coverage' class='panel'><h2>Tarama Kapsamı, Motor Durumları ve Veri Kalitesi ({esc(ass.get('scan_quality', 100))}/100)</h2>"
+        f"{gaps_html}"
+        + (
+            f"<h3>Motor Çalışma Durumları</h3><div class='table-wrap'><table><thead><tr><th>Motor</th><th>Durum</th><th>Süre</th><th>Detay</th></tr></thead><tbody>{''.join(eng_status_rows)}</tbody></table></div>"
+            if eng_status_rows
+            else ""
         )
+        + (
+            f"<h3 style='margin-top:16px'>Veri Toplama Bileşenleri</h3><div class='table-wrap'><table><thead><tr><th>Bileşen</th><th>Durum</th><th>Detay</th></tr></thead><tbody>{''.join(cov_rows)}</tbody></table></div>"
+            if cov_rows
+            else ""
+        )
+        + regions_details_html
+        + "</section>"
+    )
+
+    telem_groups_html: list[str] = []
+    for idx_g, (grp_title, rows) in enumerate(_build_structured_telemetry_groups(telem)):
+        tr_list = []
         for label, val in rows:
-            val_fmt = _format_compact_value(val, 600) if not isinstance(val, str) else val
-            telem_row_list.append(f"<tr><td>{esc(label)}</td><td><code>{esc(val_fmt)}</code></td></tr>")
-    telem_rows = "".join(telem_row_list)
+            if isinstance(val, list) and len(val) > 1:
+                items_li = "".join(f"<li><code>{esc(x)}</code></li>" for x in val[:25])
+                if len(val) > 25:
+                    items_li += f"<li><code>... (+{len(val) - 25} kayıt daha JSON raporunda)</code></li>"
+                val_cell = f"<details><summary>{len(val)} kayıt göster</summary><ul class='mini-list'>{items_li}</ul></details>"
+            else:
+                val_fmt = val[0] if isinstance(val, list) and len(val) == 1 else (_format_compact_value(val, 600) if not isinstance(val, str) else val)
+                val_cell = f"<code>{esc(val_fmt)}</code>"
+            tr_list.append(f"<tr><td>{esc(label)}</td><td>{val_cell}</td></tr>")
+        open_attr = " open" if idx_g < 2 else ""
+        telem_groups_html.append(
+            f"<details class='telem-details'{open_attr}><summary>{esc(grp_title)}</summary>"
+            f"<div class='table-wrap'><table><tbody>{''.join(tr_list)}</tbody></table></div></details>"
+        )
 
     err_html = ""
     if payload["errors"]:
         items = "".join(f"<li><code>{esc(e)}</code></li>" for e in payload["errors"])
-        err_html = f"<section class='panel'><h2>Tarama Notlari / Hatalar</h2><ul>{items}</ul></section>"
+        err_html = f"<section class='panel err-panel'><h2>Tarama Uyarıları / Hataları</h2><ul>{items}</ul></section>"
+
+    engine_options = "".join(f"<option value='{esc(e)}'>{esc(e)}</option>" for e in engines_seen)
+    domain_options = "".join(f"<option value='{esc(dk)}'>{esc(dlbl)}</option>" for dk, dlbl in domain_labels.items())
+
+    txt_export_str = render_txt_report(payload, saved_path=saved_path)
+    export_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    txt_export_blob = _safe_json_for_html_script({"filename": f"MC_SS_Raporu_{export_stamp}.txt", "content": txt_export_str})
+    json_export_blob = _safe_json_for_html_script({"filename": f"MC_SS_Raporu_{export_stamp}.json", "content": json.dumps(payload, indent=2, ensure_ascii=False)})
+    saved_path_row = f"<div><span class='mk'>Rapor Dosyası:</span> <code>{esc(saved_path)}</code></div>" if saved_path is not None else ""
 
     return f"""<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MC SS Sentinel - Adli Kontrol Raporu</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:;">
+<title>MC SS Sentinel — Adli Hile Kontrol Raporu ({score}/100)</title>
 <style>
   :root {{
-    --bg: #0b0f17;
-    --panel: #121826;
-    --card: #161e2e;
-    --border: #253047;
-    --text: #e2e8f0;
-    --muted: #94a3b8;
+    --bg: #070b12;
+    --surface: #0e1523;
+    --panel: #111a2b;
+    --card: #152035;
+    --border: #23324d;
+    --text: #e6edf7;
+    --muted: #93a4be;
+    --accent: #3b82f6;
     --crit: #ef4444;
     --high: #f97316;
     --med: #eab308;
     --low: #38bdf8;
     --info: #64748b;
+    --ok: #22c55e;
   }}
   * {{ box-sizing: border-box; }}
+  html {{ scroll-behavior: smooth; }}
   body {{
     margin: 0;
-    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-    background: var(--bg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+    background: radial-gradient(circle at top right, #101b30 0%, var(--bg) 52%);
     color: var(--text);
-    line-height: 1.5;
+    line-height: 1.55;
   }}
-  .wrap {{ max-width: 1200px; margin: 0 auto; padding: 24px 18px 60px; }}
+  .topbar {{
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    background: rgba(7, 11, 18, 0.92);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }}
+  .topbar-inner {{
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 10px 18px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    justify-content: space-between;
+  }}
+  .brand {{
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+    color: #f8fafc;
+    font-size: 0.98rem;
+  }}
+  .nav-links {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }}
+  .nav-links a {{
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 0.84rem;
+    font-weight: 600;
+    padding: 5px 10px;
+    border-radius: 7px;
+  }}
+  .nav-links a:hover {{ color: #fff; background: #172338; }}
+  .top-actions {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+  .act-btn {{
+    background: #142034;
+    color: #dbeafe;
+    border: 1px solid #2b4166;
+    border-radius: 7px;
+    padding: 6px 11px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+  }}
+  .act-btn:hover {{ background: #1d2f4d; border-color: #60a5fa; color: #fff; }}
+  .wrap {{ max-width: 1240px; margin: 0 auto; padding: 22px 18px 68px; }}
   .hero {{
-    background: linear-gradient(135deg, #111827, #1e293b);
+    background: linear-gradient(135deg, #0f172a 0%, #17243d 100%);
     border: 1px solid var(--border);
-    border-radius: 14px;
+    border-radius: 16px;
     padding: 24px;
     display: grid;
     grid-template-columns: 1fr auto;
-    gap: 20px;
+    gap: 22px;
     align-items: center;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.35);
   }}
-  .hero h1 {{ margin: 0 0 6px; font-size: 1.65rem; letter-spacing: 0.3px; }}
+  .hero h1 {{ margin: 0 0 8px; font-size: 1.55rem; letter-spacing: 0.2px; }}
   .verdict {{
     display: inline-block;
-    padding: 6px 14px;
-    border-radius: 8px;
-    font-weight: 700;
-    background: {badge_color}22;
+    padding: 7px 14px;
+    border-radius: 9px;
+    font-weight: 800;
+    font-size: 0.96rem;
+    background: {badge_color}20;
     color: {badge_color};
     border: 1px solid {badge_color};
-    margin-top: 6px;
   }}
+  .guidance {{
+    margin: 12px 0 14px;
+    color: #dbe6f5;
+    font-size: 0.93rem;
+    background: rgba(7, 11, 18, 0.45);
+    border: 1px solid #1f2e47;
+    border-radius: 10px;
+    padding: 11px 14px;
+  }}
+  .meta-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 6px 18px;
+    font-size: 0.81rem;
+    color: var(--muted);
+  }}
+  .mk {{ color: #cbd5e1; font-weight: 600; }}
+  .sha-row {{
+    margin-top: 10px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    font-size: 0.79rem;
+    color: var(--muted);
+  }}
+  .copy-btn {{
+    background: #172338;
+    color: #93c5fd;
+    border: 1px solid #2b4166;
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 0.74rem;
+    cursor: pointer;
+    font-weight: 600;
+  }}
+  .copy-btn:hover {{ background: #1e3150; color: #fff; }}
   .score-box {{
     text-align: center;
-    background: #0b101b;
+    background: #080d17;
     border: 2px solid {badge_color};
-    border-radius: 12px;
-    padding: 14px 22px;
-    min-width: 140px;
+    border-radius: 14px;
+    padding: 16px 24px;
+    min-width: 158px;
+    box-shadow: inset 0 0 24px {badge_color}18;
   }}
-  .score-num {{ font-size: 2.5rem; font-weight: 800; color: {badge_color}; line-height: 1.1; }}
-  .score-lbl {{ font-size: 0.78rem; color: var(--muted); text-transform: uppercase; }}
+  .score-num {{ font-size: 2.75rem; font-weight: 900; color: {badge_color}; line-height: 1.05; }}
+  .score-lbl {{ font-size: 0.76rem; color: var(--muted); text-transform: uppercase; margin-top: 4px; letter-spacing: 0.5px; }}
+  .score-sub {{ font-size: 0.78rem; color: #cbd5e1; margin-top: 8px; padding-top: 8px; border-top: 1px solid #1d2a40; }}
   .stats {{
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     gap: 12px;
     margin: 18px 0;
   }}
   .stat {{
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 12px 14px;
+    border-radius: 11px;
+    padding: 13px 15px;
+    transition: border-color 0.15s ease, transform 0.12s ease;
   }}
-  .stat .num {{ font-size: 1.5rem; font-weight: 700; }}
-  .stat .lbl {{ font-size: 0.8rem; color: var(--muted); }}
+  .stat.clickable {{ cursor: pointer; }}
+  .stat.clickable:hover {{ border-color: #60a5fa; transform: translateY(-1px); }}
+  .stat-top {{ display: flex; align-items: baseline; gap: 3px; }}
+  .stat .num {{ font-size: 1.55rem; font-weight: 800; line-height: 1.15; }}
+  .stat-unit {{ font-size: 0.76rem; color: var(--muted); }}
+  .stat .lbl {{ font-size: 0.8rem; color: var(--muted); margin-top: 3px; }}
+  .bar-track {{
+    margin-top: 8px;
+    height: 6px;
+    background: #090e18;
+    border-radius: 999px;
+    overflow: hidden;
+    border: 1px solid #1e2a40;
+  }}
+  .bar-fill {{ height: 100%; border-radius: 999px; }}
+  .panel {{
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-top: 22px;
+  }}
+  .panel h2 {{ margin: 0 0 12px; font-size: 1.14rem; color: #f1f5f9; }}
+  .panel h3 {{ margin: 0 0 10px; font-size: 0.96rem; color: #cbd5e1; }}
+  .clean-box {{ border-color: #166534; background: #0b1b14; }}
+  .clean-msg {{ margin: 0; color: #86efac; font-weight: 600; }}
+  .prio-list {{ display: grid; gap: 9px; }}
+  .prio-item {{
+    display: block;
+    text-decoration: none;
+    color: inherit;
+    background: #0c1320;
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--med);
+    border-radius: 9px;
+    padding: 10px 13px;
+  }}
+  .prio-item:hover {{ border-color: #60a5fa; background: #121c2e; }}
+  .prio-CRITICAL {{ border-left-color: var(--crit); }}
+  .prio-HIGH {{ border-left-color: var(--high); }}
+  .prio-top {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+  .prio-title {{ font-weight: 700; color: #f8fafc; font-size: 0.92rem; }}
+  .prio-loc {{ margin-top: 4px; font-size: 0.8rem; color: var(--muted); word-break: break-all; }}
+  .prio-ev {{ margin-top: 3px; font-size: 0.79rem; color: #cbd5e1; word-break: break-all; }}
   .controls {{
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
-    margin: 18px 0;
+    margin: 22px 0 12px;
     align-items: center;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 14px;
   }}
   .btn {{
-    background: var(--panel);
+    background: #0d1422;
     color: var(--text);
     border: 1px solid var(--border);
-    padding: 7px 13px;
+    padding: 6px 11px;
     border-radius: 8px;
     cursor: pointer;
     font-weight: 600;
-    font-size: 0.85rem;
+    font-size: 0.82rem;
   }}
-  .btn.active, .btn:hover {{ border-color: #60a5fa; background: #1e293b; }}
-  input.search {{
-    flex: 1;
-    min-width: 220px;
-    background: var(--panel);
+  .btn.active, .btn:hover {{ border-color: #60a5fa; background: #1b2a44; color: #fff; }}
+  select.filter-sel, input.search {{
+    background: #0b111d;
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 8px 12px;
-    font-size: 0.9rem;
+    padding: 7px 10px;
+    font-size: 0.84rem;
   }}
+  input.search {{ flex: 1; min-width: 220px; }}
+  .match-count {{ width: 100%; font-size: 0.8rem; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }}
   .card {{
     background: var(--card);
     border: 1px solid var(--border);
     border-left: 5px solid var(--info);
-    border-radius: 10px;
+    border-radius: 11px;
     padding: 16px 18px;
     margin-bottom: 12px;
   }}
@@ -1712,120 +2069,292 @@ def render_html_report(payload: dict[str, Any]) -> str:
   .pill {{
     padding: 2px 9px;
     border-radius: 999px;
-    font-size: 0.74rem;
+    font-size: 0.72rem;
     font-weight: 700;
   }}
-  .pill-CRITICAL {{ background: #ef444433; color: #fca5a5; }}
-  .pill-HIGH {{ background: #f9731633; color: #fdba74; }}
-  .pill-MEDIUM {{ background: #eab30833; color: #fde047; }}
-  .pill-LOW {{ background: #38bdf833; color: #7dd3fc; }}
-  .pill-INFO {{ background: #64748b33; color: #cbd5e1; }}
-  .pill-conf {{ background: #334155; color: #e2e8f0; }}
-  .rule-id {{ font-family: monospace; color: #93c5fd; font-size: 0.85rem; }}
-  .eng-tag {{ margin-left: auto; color: var(--muted); font-size: 0.8rem; }}
-  .card h3 {{ margin: 4px 0 6px; font-size: 1.08rem; }}
-  .desc {{ margin: 0 0 10px; color: #cbd5e1; font-size: 0.93rem; }}
-  .meta-row {{ display: flex; flex-wrap: wrap; gap: 14px; font-size: 0.83rem; color: var(--muted); margin-bottom: 8px; }}
+  .pill-CRITICAL {{ background: #ef44442e; color: #fca5a5; border: 1px solid #ef444466; }}
+  .pill-HIGH {{ background: #f973162e; color: #fdba74; border: 1px solid #f9731666; }}
+  .pill-MEDIUM {{ background: #eab3082e; color: #fde047; border: 1px solid #eab30866; }}
+  .pill-LOW {{ background: #38bdf82e; color: #7dd3fc; border: 1px solid #38bdf866; }}
+  .pill-INFO {{ background: #64748b2e; color: #cbd5e1; border: 1px solid #64748b66; }}
+  .pill-conf {{ background: #26344b; color: #e2e8f0; }}
+  .rule-id {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #93c5fd; font-size: 0.82rem; }}
+  .eng-tag {{ margin-left: auto; color: var(--muted); font-size: 0.79rem; }}
+  .card h3 {{ margin: 4px 0 6px; font-size: 1.04rem; color: #f8fafc; }}
+  .desc {{ margin: 0 0 10px; color: #cbd5e1; font-size: 0.91rem; }}
+  .meta-row {{ display: flex; flex-wrap: wrap; gap: 10px 16px; font-size: 0.82rem; color: var(--muted); margin-bottom: 8px; }}
   .ev-list {{
-    background: #0b101b;
-    border: 1px solid #1e293b;
+    background: #0a101b;
+    border: 1px solid #1d2a40;
     border-radius: 8px;
-    padding: 10px 14px 10px 28px;
+    padding: 10px 14px 10px 26px;
     margin: 8px 0 0;
     overflow-x: auto;
   }}
-  .ev-list li {{ margin: 4px 0; font-size: 0.84rem; word-break: break-all; }}
+  .ev-list li {{ margin: 4px 0; font-size: 0.82rem; word-break: break-all; }}
+  .ev-more summary {{ cursor: pointer; color: #93c5fd; font-size: 0.82rem; margin-top: 8px; font-weight: 600; }}
   .rec {{
     margin-top: 10px;
+    padding: 9px 12px;
+    border-radius: 8px;
+    background: #13254a;
+    border: 1px solid #1e3a6e;
+    color: #dbeafe;
+    font-size: 0.84rem;
+  }}
+  .st-pill {{ display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 0.74rem; font-weight: 700; }}
+  .st-ok {{ background: #14532d66; color: #86efac; border: 1px solid #16a34a66; }}
+  .st-warn {{ background: #713f1266; color: #fde047; border: 1px solid #ca8a0466; }}
+  .st-err {{ background: #7f1d1d66; color: #fca5a5; border: 1px solid #dc262666; }}
+  .warn-box {{
+    background: #2b1d0b;
+    border: 1px solid #92400e;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    color: #fde68a;
+    font-size: 0.84rem;
+  }}
+  .warn-box ul {{ margin: 6px 0 0; padding-left: 20px; }}
+  .err-panel {{ border-color: #7f1d1d; }}
+  .table-wrap {{ overflow-x: auto; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.83rem; }}
+  th {{ color: #93c5fd; background: #0c1321; font-weight: 700; }}
+  td, th {{ padding: 8px 10px; border-bottom: 1px solid #1d293e; vertical-align: top; word-break: break-word; text-align: left; }}
+  td:first-child {{ width: 260px; color: #cbd5e1; font-weight: 600; }}
+  .telem-details, .sub-details {{
+    margin-top: 10px;
+    border: 1px solid #1e2c44;
+    border-radius: 9px;
+    background: #0c1320;
     padding: 8px 12px;
-    border-radius: 7px;
-    background: #172554;
-    color: #bfdbfe;
-    font-size: 0.85rem;
   }}
-  .panel {{
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 18px;
+  .telem-details summary, .sub-details summary {{
+    cursor: pointer;
+    font-weight: 700;
+    color: #93c5fd;
+    font-size: 0.9rem;
+    padding: 3px 0;
+  }}
+  .mini-list {{ margin: 6px 0 0; padding-left: 18px; }}
+  .mini-list li {{ margin: 2px 0; font-size: 0.8rem; word-break: break-all; }}
+  .reg-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-top: 10px; }}
+  .reg-group {{ background: #09101c; border: 1px solid #1d293e; border-radius: 8px; padding: 10px 12px; }}
+  .reg-group h4 {{ margin: 0 0 6px; font-size: 0.84rem; color: #bfdbfe; }}
+  .reg-group ul {{ margin: 0; padding-left: 18px; font-size: 0.78rem; color: var(--muted); }}
+  .footer-summary {{
     margin-top: 24px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: linear-gradient(135deg, #0b1220, #121b2e);
+    padding: 18px 20px;
+    font-size: 0.85rem;
+    color: #cbd5e1;
   }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 0.84rem; }}
-  td, th {{ padding: 7px 10px; border-bottom: 1px solid #1e293b; vertical-align: top; word-break: break-all; text-align: left; }}
-  td:first-child {{ width: 240px; color: var(--muted); font-weight: 600; }}
-  code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
-  .meta-foot {{ margin-top: 10px; font-size: 0.78rem; color: var(--muted); word-break: break-all; }}
+  code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }}
+  @media (max-width: 720px) {{
+    .hero {{ grid-template-columns: 1fr; }}
+    .score-box {{ width: 100%; }}
+  }}
+  @media print {{
+    body {{ background: #fff !important; color: #111 !important; }}
+    .topbar, .controls, .act-btn, .copy-btn {{ display: none !important; }}
+    .hero, .panel, .card, .stat, .footer-summary {{
+      background: #fff !important;
+      color: #111 !important;
+      border-color: #cbd5e1 !important;
+      box-shadow: none !important;
+    }}
+    .desc, .meta-row, .meta-grid, .lbl, .prio-loc, .prio-ev {{ color: #334155 !important; }}
+    .ev-list, .rec {{ background: #f8fafc !important; color: #111 !important; border-color: #cbd5e1 !important; }}
+  }}
 </style>
 </head>
 <body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M12 2L4 5v6c0 5.55 3.84 10.74 8 12 4.16-1.26 8-6.45 8-12V5l-8-3z" fill="{badge_color}33" stroke="{badge_color}" stroke-width="2"/>
+        <path d="M9 12l2 2 4-4" stroke="#f8fafc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span>MC SS Sentinel</span>
+    </div>
+    <nav class="nav-links">
+      <a href="#summary">Özet</a>
+      <a href="#priority">Öncelikli</a>
+      <a href="#findings-sec">Bulgular ({ass['total_findings']})</a>
+      <a href="#coverage">Kapsam</a>
+      <a href="#telemetry">Telemetri</a>
+    </nav>
+    <div class="top-actions">
+      <button class="act-btn" type="button" onclick="downloadBlob('ss-txt-blob', 'text/plain;charset=utf-8')">TXT İndir</button>
+      <button class="act-btn" type="button" onclick="downloadBlob('ss-json-blob', 'application/json;charset=utf-8')">JSON İndir</button>
+      <button class="act-btn" type="button" onclick="window.print()">Yazdır / PDF</button>
+    </div>
+  </div>
+</header>
+
 <div class="wrap">
-  <section class="hero">
+  <section id="summary" class="hero">
     <div>
-      <h1>MC SS Sentinel — Derin Linux Adli Kontrol Raporu</h1>
+      <h1>MC SS Sentinel — Adli Hile Kontrol (SS) Raporu</h1>
       <div class="verdict">{esc(ass['verdict'])}</div>
-      <div class="meta-foot">
-        Hile Karari: <code>{esc(ass.get('cheat_verdict_level', vlevel))}</code> |
-        Tarama Kalitesi: <code>{esc(ass.get('scan_quality', 100))}/100</code> |
-        UTC: {esc(payload['generated_utc'])} | Ev Dizini: <code>{esc(payload['target_home'])}</code> |
-        OS Profili: <code>{esc(payload.get('target_os_name', 'auto'))}</code> |
-        Veri Ozeti SHA-256: <code>{esc(payload['report_sha256'])}</code>
+      <div class="guidance">{esc(_verdict_guidance_text(ass))}</div>
+      <div class="meta-grid">
+        <div><span class="mk">Tarih (Yerel):</span> <code>{esc(local_now)}</code></div>
+        <div><span class="mk">Tarih (UTC):</span> <code>{esc(payload['generated_utc'])}</code></div>
+        <div><span class="mk">Hedef Ev Dizini:</span> <code>{esc(payload['target_home'])}</code></div>
+        <div><span class="mk">Hedef OS / Host OS:</span> <code>{esc(payload.get('target_os_name', 'auto'))}</code> / <code>{esc(payload.get('host_os_name') or 'bilinmiyor')}</code></div>
+        <div><span class="mk">Tarama Kapsamı:</span> <code>{total_procs} süreç (Java={len(java_pids)}, MC={len(mc_pids)}) · {deep_count} derin dosya · {len(mc_inst)} MC profili · {total_dur} sn</code></div>
+        <div><span class="mk">Ring-0 / IOMMU:</span> <code>LKM={'AKTİF' if lkm_act else 'KAPALI (Userspace Fallback)'} · IOMMU={esc(iommu_lbl)}</code></div>
+        {saved_path_row}
+      </div>
+      <div class="sha-row">
+        <span><span class="mk">Veri Özeti SHA-256:</span> <code id="shaVal">{esc(payload['report_sha256'])}</code></span>
+        <button class="copy-btn" type="button" onclick="copySha(this)">Kopyala</button>
       </div>
     </div>
     <div class="score-box">
       <div class="score-num">{score}</div>
-      <div class="score-lbl">Risk Puani / 100</div>
+      <div class="score-lbl">Risk Puanı / 100</div>
+      <div class="score-sub">
+        Hile Seviyesi: <strong>{esc(ass.get('cheat_verdict_level', vlevel))}</strong><br>
+        Kalite: <strong>{esc(ass.get('scan_quality', 100))}/100</strong>
+      </div>
     </div>
   </section>
 
   <section class="stats">
-    <div class="stat"><div class="num" style="color:var(--crit)">{counts['CRITICAL']}</div><div class="lbl">CRITICAL</div></div>
-    <div class="stat"><div class="num" style="color:var(--high)">{counts['HIGH']}</div><div class="lbl">HIGH</div></div>
-    <div class="stat"><div class="num" style="color:var(--med)">{counts['MEDIUM']}</div><div class="lbl">MEDIUM</div></div>
-    <div class="stat"><div class="num" style="color:var(--low)">{counts['LOW']}</div><div class="lbl">LOW</div></div>
-    <div class="stat"><div class="num">{ass['total_findings']}</div><div class="lbl">Toplam Bulgu</div></div>
+    <div class="stat clickable" onclick="quickFilter('CRITICAL')"><div class="num" style="color:var(--crit)">{counts['CRITICAL']}</div><div class="lbl">KRİTİK (CRITICAL)</div></div>
+    <div class="stat clickable" onclick="quickFilter('HIGH')"><div class="num" style="color:var(--high)">{counts['HIGH']}</div><div class="lbl">YÜKSEK (HIGH)</div></div>
+    <div class="stat clickable" onclick="quickFilter('MEDIUM')"><div class="num" style="color:var(--med)">{counts['MEDIUM']}</div><div class="lbl">ORTA (MEDIUM)</div></div>
+    <div class="stat clickable" onclick="quickFilter('LOW')"><div class="num" style="color:var(--low)">{counts['LOW']}</div><div class="lbl">DÜŞÜK (LOW)</div></div>
+    <div class="stat clickable" onclick="quickFilter('INFO')"><div class="num" style="color:var(--info)">{counts['INFO']}</div><div class="lbl">BİLGİ (INFO)</div></div>
+    <div class="stat clickable" onclick="quickFilter('ALL')"><div class="num">{ass['total_findings']}</div><div class="lbl">Toplam Bulgu</div></div>
   </section>
+
   {domain_cards_html}
+  {priority_section_html}
 
-  <section class="controls">
-    <button class="btn active" onclick="filterSev('ALL', this)">Tumu</button>
-    <button class="btn" onclick="filterSev('CRITICAL', this)">CRITICAL</button>
-    <button class="btn" onclick="filterSev('HIGH', this)">HIGH</button>
-    <button class="btn" onclick="filterSev('MEDIUM', this)">MEDIUM</button>
-    <button class="btn" onclick="filterSev('LOW', this)">LOW</button>
-    <button class="btn" onclick="filterSev('INFO', this)">INFO</button>
-    <input class="search" type="search" id="searchBox" placeholder="Bulgu, dosya yolu, PID veya kural ara..." oninput="applyFilters()">
-  </section>
+  <section id="findings-sec">
+    <div class="controls">
+      <button class="btn active" data-sev-btn="ALL" onclick="filterSev('ALL', this)">Tümü ({ass['total_findings']})</button>
+      <button class="btn" data-sev-btn="CRITICAL" onclick="filterSev('CRITICAL', this)">CRITICAL ({counts['CRITICAL']})</button>
+      <button class="btn" data-sev-btn="HIGH" onclick="filterSev('HIGH', this)">HIGH ({counts['HIGH']})</button>
+      <button class="btn" data-sev-btn="MEDIUM" onclick="filterSev('MEDIUM', this)">MEDIUM ({counts['MEDIUM']})</button>
+      <button class="btn" data-sev-btn="LOW" onclick="filterSev('LOW', this)">LOW ({counts['LOW']})</button>
+      <button class="btn" data-sev-btn="INFO" onclick="filterSev('INFO', this)">INFO ({counts['INFO']})</button>
+      <select class="filter-sel" id="engineFilter" onchange="applyFilters()" aria-label="Motor filtresi">
+        <option value="ALL">Tüm Motorlar</option>
+        {engine_options}
+      </select>
+      <select class="filter-sel" id="domainFilter" onchange="applyFilters()" aria-label="Alan filtresi">
+        <option value="ALL">Tüm Alanlar</option>
+        {domain_options}
+      </select>
+      <input class="search" type="search" id="searchBox" placeholder="Bulgu, dosya yolu, PID, kural veya imza ara..." oninput="applyFilters()">
+      <button class="btn" type="button" onclick="resetFilters()">Sıfırla</button>
+      <div class="match-count">
+        <span id="visibleCount">Gösterilen: {ass['total_findings']} / {ass['total_findings']} bulgu</span>
+        <span>%100 Çevrimdışı Yerel Rapor · MC SS Sentinel</span>
+      </div>
+    </div>
 
-  <section id="findings">
-    {"".join(finding_cards) if finding_cards else "<div class='panel'>Hicbir supheli bulgu tespit edilmedi.</div>"}
+    <div id="findings">
+      {"".join(finding_cards) if finding_cards else "<div class='panel clean-box'><p class='clean-msg'>Hiçbir şüpheli bulgu tespit edilmedi.</p></div>"}
+    </div>
   </section>
 
   {breakdown_html}
   {cov_html}
 
-  <section class="panel">
-    <h2>Sistem Telemetrisi</h2>
-    <table>{telem_rows}</table>
+  <section id="telemetry" class="panel">
+    <h2>Sistem, Ring-0 Çekirdek, Donanım ve Oyun Ortamı Telemetrisi</h2>
+    {"".join(telem_groups_html)}
   </section>
   {err_html}
+
+  <footer class="footer-summary">
+    <strong>Kısa Sonuç Özeti:</strong> {esc(ass['verdict'])} —
+    Risk Puanı <strong>{score}/100</strong> · Hile Seviyesi <strong>{esc(ass.get('cheat_verdict_level', vlevel))}</strong> ·
+    Tarama Kalitesi <strong>{esc(ass.get('scan_quality', 100))}/100</strong> ·
+    Veri Özeti SHA-256: <code>{esc(payload['report_sha256'])}</code>
+  </footer>
 </div>
+
+<script id="ss-txt-blob" type="application/json">{txt_export_blob}</script>
+<script id="ss-json-blob" type="application/json">{json_export_blob}</script>
 <script>
 let currentSev = 'ALL';
 function filterSev(sev, btn) {{
   currentSev = sev;
-  document.querySelectorAll('.controls .btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
+  document.querySelectorAll('.controls [data-sev-btn]').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
   applyFilters();
+}}
+function quickFilter(sev) {{
+  const targetBtn = document.querySelector('.controls [data-sev-btn="' + sev + '"]');
+  filterSev(sev, targetBtn);
+  const sec = document.getElementById('findings-sec');
+  if (sec) sec.scrollIntoView({{ behavior: 'smooth' }});
+}}
+function resetFilters() {{
+  document.getElementById('engineFilter').value = 'ALL';
+  document.getElementById('domainFilter').value = 'ALL';
+  document.getElementById('searchBox').value = '';
+  const allBtn = document.querySelector('.controls [data-sev-btn="ALL"]');
+  filterSev('ALL', allBtn);
+}}
+function jumpToFinding(id) {{
+  resetFilters();
+  const el = document.getElementById(id);
+  if (el) el.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
 }}
 function applyFilters() {{
   const q = document.getElementById('searchBox').value.trim().toLowerCase();
-  document.querySelectorAll('#findings .card').forEach(card => {{
+  const eng = document.getElementById('engineFilter').value;
+  const dom = document.getElementById('domainFilter').value;
+  const cards = document.querySelectorAll('#findings .card');
+  let shown = 0;
+  cards.forEach(card => {{
     const s = card.getAttribute('data-sev');
+    const e = card.getAttribute('data-engine');
+    const d = card.getAttribute('data-domain');
     const txt = card.getAttribute('data-search') || '';
-    const okSev = (currentSev === 'ALL' || s === currentSev);
-    const okQ = (!q || txt.includes(q));
-    card.style.display = (okSev && okQ) ? 'block' : 'none';
+    const ok = (currentSev === 'ALL' || s === currentSev)
+      && (eng === 'ALL' || e === eng)
+      && (dom === 'ALL' || d === dom)
+      && (!q || txt.includes(q));
+    card.style.display = ok ? 'block' : 'none';
+    if (ok) shown += 1;
   }});
+  const vc = document.getElementById('visibleCount');
+  if (vc) vc.textContent = 'Gösterilen: ' + shown + ' / ' + cards.length + ' bulgu';
+}}
+function copySha(btn) {{
+  const sha = document.getElementById('shaVal').textContent || '';
+  if (navigator.clipboard && navigator.clipboard.writeText) {{
+    navigator.clipboard.writeText(sha).then(() => {{
+      const prev = btn.textContent;
+      btn.textContent = 'Kopyalandı';
+      setTimeout(() => btn.textContent = prev, 1500);
+    }});
+  }}
+}}
+function downloadBlob(elemId, mimeType) {{
+  const raw = document.getElementById(elemId);
+  if (!raw) return;
+  const parsed = JSON.parse(raw.textContent);
+  const blob = new Blob([parsed.content], {{ type: mimeType }});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = parsed.filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }}
 </script>
 </body>
@@ -1839,9 +2368,14 @@ def _write_text_strict(path: Path, content: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def write_reports(ctx: ScanContext, out_dir: Path) -> dict[str, Path]:
+def write_reports(
+    ctx: ScanContext,
+    out_dir: Path,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    payload = build_report_payload(ctx)
+    if payload is None:
+        payload = build_report_payload(ctx)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     tag = stamp
@@ -1858,7 +2392,7 @@ def write_reports(ctx: ScanContext, out_dir: Path) -> dict[str, Path]:
     json_path = out_dir / f"ss_report_{tag}.json"
     sha_path = out_dir / f"ss_report_{tag}.sha256"
 
-    html_sha = _write_text_strict(html_path, render_html_report(payload))
+    html_sha = _write_text_strict(html_path, render_html_report(payload, saved_path=html_path))
     txt_sha = _write_text_strict(txt_path, render_txt_report(payload, saved_path=txt_path))
     json_sha = _write_text_strict(json_path, json.dumps(payload, indent=2, ensure_ascii=False))
     sha_lines = [
@@ -1869,6 +2403,29 @@ def write_reports(ctx: ScanContext, out_dir: Path) -> dict[str, Path]:
     _write_text_strict(sha_path, "\n".join(sha_lines) + "\n")
 
     return {"html": html_path, "txt": txt_path, "json": json_path, "sha256": sha_path}
+
+
+def write_desktop_html_report(
+    ctx: ScanContext, desktop_dir: Path | None = None
+) -> tuple[Path, dict[str, Any]]:
+    """Write self-contained clickable offline HTML web report directly to the user's Desktop."""
+    from .utils import resolve_desktop_dir
+
+    target_desktop = desktop_dir if desktop_dir is not None else resolve_desktop_dir(ctx.home_dir)
+    target_desktop.mkdir(parents=True, exist_ok=True)
+
+    payload = build_report_payload(ctx)
+    local_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    html_path = target_desktop / f"MC_SS_Raporu_{local_stamp}.html"
+    counter = 1
+    while html_path.exists():
+        html_path = target_desktop / f"MC_SS_Raporu_{local_stamp}_{counter}.html"
+        counter += 1
+
+    file_sha = _write_text_strict(html_path, render_html_report(payload, saved_path=html_path))
+    payload["desktop_html_file_sha256"] = file_sha
+    payload["desktop_report_path"] = str(html_path)
+    return html_path, payload
 
 
 def write_desktop_txt_report(

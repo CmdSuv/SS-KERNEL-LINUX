@@ -17,7 +17,7 @@
       "notes": "Compiles on Fedora 43 floor for seamless compatibility on Fedora 43-45 & Nobara + dnf/grubby + kernel-devel."
     },
     "ubuntu_24_04": {
-      "display_name": "Ubuntu 24.04 LTS / Mint 22 / Pop!_OS 24.04",
+      "display_name": "Ubuntu 24.04 LTS / Pop!_OS 24.04",
       "dockerfile": "packaging/dockerfiles/Dockerfile.ubuntu_24_04",
       "image_tag": "mc-ss-sentinel-builder:ubuntu_24_04",
       "base_image": "docker.io/library/ubuntu:24.04",
@@ -25,7 +25,7 @@
       "notes": "Compiles native probe & Qt6 bundle against glibc 2.39 & Linux 6.8 UAPI; includes Snap/GRUB/kernelstub/AppArmor support."
     },
     "ubuntu_22_04": {
-      "display_name": "Ubuntu 22.04 LTS / Mint 21 / Pop!_OS 22.04",
+      "display_name": "Ubuntu 22.04 LTS / Pop!_OS 22.04",
       "dockerfile": "packaging/dockerfiles/Dockerfile.ubuntu_22_04",
       "image_tag": "mc-ss-sentinel-builder:ubuntu_22_04",
       "base_image": "docker.io/library/ubuntu:22.04",
